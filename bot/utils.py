@@ -8,6 +8,7 @@ _LATEX_INLINE = re.compile(r"\\\((.*?)\\\)|\\\[(.*?)\\\]|\$(.+?)\$", re.DOTALL)
 _HTML_TAG = re.compile(r"<[^>]+>")
 _MULTI_NL = re.compile(r"\n{3,}")
 _CODE_FENCE = re.compile(r"```(\w*)\n?(.*?)```", re.DOTALL)
+_INLINE_CODE = re.compile(r"`([^`]+)`")
 
 
 def clean_text(text: str) -> str:
@@ -25,12 +26,9 @@ def clean_text(text: str) -> str:
 
 
 def format_ai_answer(text: str) -> str:
-    """Mira-bot-style: preserve ```code blocks``` and basic markdown.
-    Strips LaTeX/HTML but KEEPS code fences so Telegram renders them nicely.
-    Returns text safe to send with parse_mode='Markdown' (legacy)."""
+    """Convert AI output to Telegram-safe HTML while preserving code blocks."""
     if not text:
         return ""
-    # Extract code blocks first to protect them
     blocks = []
 
     def _stash(m):
@@ -41,21 +39,20 @@ def format_ai_answer(text: str) -> str:
         return f"\x00CODE{idx}\x00"
 
     t = _CODE_FENCE.sub(_stash, text)
-    # Clean LaTeX & HTML outside code
     t = _LATEX_BLOCK.sub("", t)
     t = _LATEX_INLINE.sub(lambda m: next((g for g in m.groups() if g), ""), t)
-    t = _HTML_TAG.sub("", t)
-    # Convert lone markdown list bullets to •
+    t = html.escape(_HTML_TAG.sub("", t), quote=False)
     t = re.sub(r"^\s*[-+]\s+", "• ", t, flags=re.MULTILINE)
-    # Escape stray backticks (single) so Markdown doesn't break — but keep inline `x`
-    # legacy Markdown only treats `code`, *bold*, _italic_. We'll leave those.
     t = _MULTI_NL.sub("\n\n", t)
-    # Restore code blocks
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*", r"<b>\1</b>", t)
+    t = re.sub(r"__(.+?)__", r"<u>\1</u>", t)
+    t = re.sub(r"(?<!_)_(?!\s)(.+?)(?<!\s)_", r"<i>\1</i>", t)
+    t = _INLINE_CODE.sub(lambda m: f"<code>{html.escape(m.group(1), quote=False)}</code>", t)
     for i, (lang, code) in enumerate(blocks):
-        # Escape backticks inside code so the fence isn't broken
-        safe_code = code.replace("```", "''' ")
-        fence = f"```{lang}\n{safe_code}\n```" if lang else f"```\n{safe_code}\n```"
-        t = t.replace(f"\x00CODE{i}\x00", fence)
+        safe_code = html.escape(code.replace("```", "''' "), quote=False)
+        block = f"<pre><code class=\"language-{lang}\">{safe_code}</code></pre>" if lang else f"<pre>{safe_code}</pre>"
+        t = t.replace(f"\x00CODE{i}\x00", block)
     return t.strip()
 
 

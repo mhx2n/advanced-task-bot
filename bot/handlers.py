@@ -4,20 +4,22 @@ import os
 import time
 import traceback
 from collections import defaultdict
+from uuid import uuid4
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
+    InlineQueryResultArticle, InputTextMessageContent,
 )
 from telegram.constants import ChatAction, ChatMemberStatus, ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters,
+    ContextTypes, InlineQueryHandler, filters,
 )
 
 from . import db, downloader
 from .config import OWNER_ID, FORCE_JOIN_CHANNEL
-from .providers import REGISTRY
+from .providers import REGISTRY, register as register_provider, make_openai_compatible_provider
 from .utils import clean_text, format_ai_answer, chunk_text, escape_html, human_size
 from .keycheck import inspect_key, try_model
 
@@ -62,14 +64,14 @@ async def force_join_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
 
 
 async def send_md(target_msg_or_chat, text: str, context=None, **kw):
-    """Send a (possibly long) message, trying Markdown first then plain."""
+    """Send a (possibly long) message with safe HTML formatting."""
     text = text or ""
     chunks = list(chunk_text(text))
     first = None
     for c in chunks:
         try:
             m = await target_msg_or_chat.reply_text(
-                c, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True, **kw,
+                c, parse_mode=ParseMode.HTML, disable_web_page_preview=True, **kw,
             )
         except Exception:
             m = await target_msg_or_chat.reply_text(
@@ -84,7 +86,7 @@ async def safe_edit(message, text: str, reply_markup=None):
     chunks = list(chunk_text(text))
     try:
         await message.edit_text(
-            chunks[0], parse_mode=ParseMode.MARKDOWN,
+            chunks[0], parse_mode=ParseMode.HTML,
             disable_web_page_preview=True, reply_markup=reply_markup,
         )
     except Exception:
@@ -96,10 +98,23 @@ async def safe_edit(message, text: str, reply_markup=None):
             return
     for extra in chunks[1:]:
         try:
-            await message.reply_text(extra, parse_mode=ParseMode.MARKDOWN,
+            await message.reply_text(extra, parse_mode=ParseMode.HTML,
                                      disable_web_page_preview=True)
         except Exception:
             await message.reply_text(clean_text(extra), disable_web_page_preview=True)
+
+
+async def stream_edit(message, text: str, reply_markup=None):
+    text = text or ""
+    if len(text) < 500:
+        await safe_edit(message, text, reply_markup=reply_markup)
+        return
+    steps = 5
+    for i in range(1, steps + 1):
+        chunk = text[: max(1, int(len(text) * i / steps))]
+        await safe_edit(message, chunk, reply_markup=reply_markup if i == steps else None)
+        if i != steps:
+            await asyncio.sleep(0.35)
 
 
 # ============================================================
@@ -274,9 +289,9 @@ async def _call_provider(update: Update, context: ContextTypes.DEFAULT_TYPE,
     try:
         answer = await asyncio.wait_for(fn(prompt, history), timeout=180)
         answer_fmt = format_ai_answer(answer) or "No content returned."
-        body = f"*{name}*\n\n{answer_fmt}"
+        body = f"<b>{escape_html(name)}</b>\n\n{answer_fmt}"
         if placeholder:
-            await safe_edit(placeholder, body)
+            await stream_edit(placeholder, body)
             sent = placeholder
         else:
             sent = await send_md(update.effective_message, body)
@@ -285,8 +300,10 @@ async def _call_provider(update: Update, context: ContextTypes.DEFAULT_TYPE,
         hist = _HISTORY[(update.effective_chat.id, new_root)]
         hist.append({"q": prompt, "a": (answer or "")[:4000]})
         _HISTORY[(update.effective_chat.id, new_root)] = hist[-10:]
-        await db.save_session(update.effective_chat.id, new_root, provider_key,
-                              json.dumps(_HISTORY[(update.effective_chat.id, new_root)]))
+        state = json.dumps(_HISTORY[(update.effective_chat.id, new_root)])
+        await db.save_session(update.effective_chat.id, new_root, provider_key, state)
+        if sent.message_id != new_root:
+            await db.save_session(update.effective_chat.id, sent.message_id, provider_key, state)
         await db.log("INFO", update.effective_user.id, provider_key, prompt[:200])
     except asyncio.TimeoutError:
         msg = f"{name} timed out. Please retry."
@@ -333,30 +350,30 @@ async def _do_inspect(update: Update, key: str):
         info = await inspect_key(key)
         if not info.get("valid"):
             await safe_edit(placeholder,
-                f"*{info.get('provider', 'Unknown')}*  •  INVALID\n"
-                f"Status: `{info.get('status')}`\n"
-                f"Detail: `{json.dumps(info.get('error'))[:500]}`")
+                f"<b>{escape_html(info.get('provider', 'Unknown'))}</b>  •  INVALID\n"
+                f"Status: <code>{escape_html(str(info.get('status')))}</code>\n"
+                f"Detail: <code>{escape_html(json.dumps(info.get('error'))[:500])}</code>")
             return
         _PENDING_KEY[update.effective_user.id] = key
         models = info.get("models", [])
         limits = info.get("limits", {})
         lines = [
-            f"*{info['provider']}*  •  ACTIVE",
-            f"Models available: *{len(models)}*",
+            f"<b>{escape_html(info['provider'])}</b>  •  ACTIVE",
+            f"Models available: <b>{len(models)}</b>",
             "",
         ]
         for m in models[:30]:
-            lines.append(f"• `{m}`")
+            lines.append(f"• <code>{escape_html(m)}</code>")
         if len(models) > 30:
             lines.append(f"... +{len(models)-30} more")
         if limits:
-            lines.append("\n*Limits / Quota:*")
+            lines.append("\n<b>Limits / Quota:</b>")
             for k, v in limits.items():
-                lines.append(f"  • {k}: `{v}`")
-        lines.append("\nTry a model: `/tryke <model> <prompt>`")
+                lines.append(f"  • {escape_html(str(k))}: <code>{escape_html(str(v))}</code>")
+        lines.append("\nTry a model: <code>/tryke &lt;model&gt; &lt;prompt&gt;</code>")
         await safe_edit(placeholder, "\n".join(lines))
     except Exception as e:
-        await safe_edit(placeholder, f"Inspection failed: `{e}`")
+        await safe_edit(placeholder, f"Inspection failed: <code>{escape_html(str(e))}</code>")
 
 
 async def cmd_tryke(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -373,9 +390,9 @@ async def cmd_tryke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     placeholder = await update.effective_message.reply_text(f"Calling {model}...")
     try:
         out = await asyncio.wait_for(try_model(key, model, prompt), timeout=120)
-        await safe_edit(placeholder, f"*{model}*\n\n{format_ai_answer(out)}")
+        await stream_edit(placeholder, f"<b>{escape_html(model)}</b>\n\n{format_ai_answer(out)}")
     except Exception as e:
-        await safe_edit(placeholder, f"Call failed: `{e}`")
+        await safe_edit(placeholder, f"Call failed: <code>{escape_html(str(e))}</code>")
 
 
 # ============================================================
@@ -408,14 +425,13 @@ async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
             try:
                 await status.edit_text(f"Uploading ({human_size(info['size'])})...")
             except Exception: pass
-            caption = (
-                f"*{escape_html(info['title']) or 'Video'}*\n"
-                f"_{escape_html(info['uploader'])}_  •  {human_size(info['size'])}"
-            )
+            caption = clean_text(
+                f"{info['title'] or 'Video'}\n{info['uploader']} • {human_size(info['size'])}"
+            )[:900]
             with open(info["path"], "rb") as f:
                 await context.bot.send_video(
                     chat_id=chat_id, video=f, caption=caption,
-                    parse_mode=ParseMode.MARKDOWN, supports_streaming=True,
+                    supports_streaming=True,
                     write_timeout=180, read_timeout=180,
                 )
             try: await status.delete()
@@ -437,6 +453,16 @@ async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
 # ============================================================
 async def _owner_only(update: Update) -> bool:
     return is_owner(update.effective_user.id)
+
+
+async def load_custom_providers(app: Application | None = None):
+    rows = await db.list_custom_providers()
+    for cmd, name, base_url, api_key, model, enabled in rows:
+        if not enabled:
+            continue
+        register_provider(cmd, name, make_openai_compatible_provider(name, base_url, api_key, model))
+        if app:
+            app.add_handler(CommandHandler(cmd, make_provider_handler(cmd)))
 
 
 async def cmd_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -553,7 +579,61 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.set_setting("live_response", new)
     await update.effective_message.reply_text(
         f"Live response is now: {new.upper()}\n"
-        f"(When OFF, the bot won't show 'thinking...' previews — only final answers.)")
+        f"(When ON, the answer text appears progressively like live typing.)")
+
+
+async def cmd_addprovider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _owner_only(update): return
+    if len(context.args) < 5:
+        await update.effective_message.reply_text(
+            "Usage: /addprovider <cmd> <name> <base_url> <api_key> <model>"
+        )
+        return
+    from .providers import register, make_openai_compatible_provider
+    cmd = context.args[0].lower().strip()
+    name, base_url, api_key = context.args[1], context.args[2], context.args[3]
+    model = " ".join(context.args[4:]).strip()
+    func = make_openai_compatible_provider(name, base_url, api_key, model)
+    register(cmd, name, func)
+    await db.add_custom_provider(cmd, name, base_url, api_key, model)
+    await setup_bot_commands(context.application)
+    await update.effective_message.reply_text(f"Provider added: /{cmd} and .{cmd}")
+
+
+async def cmd_delprovider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _owner_only(update): return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /delprovider <cmd>")
+        return
+    cmd = context.args[0].lower().strip()
+    REGISTRY.pop(cmd, None)
+    await db.remove_custom_provider(cmd)
+    await setup_bot_commands(context.application)
+    await update.effective_message.reply_text(f"Provider removed: {cmd}")
+
+
+async def cmd_providers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["<b>Available providers</b>", ""]
+    for key, (name, _) in REGISTRY.items():
+        lines.append(f"• <b>{escape_html(name)}</b> — <code>/{key}</code> or <code>.{key}</code>")
+    await send_md(update.effective_message, "\n".join(lines))
+
+
+async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = (update.inline_query.query or "").strip()
+    if not query:
+        return
+    results = []
+    for key, (name, _) in list(REGISTRY.items())[:12]:
+        results.append(
+            InlineQueryResultArticle(
+                id=str(uuid4()),
+                title=f"Ask {name}",
+                description=f"Send to bot as .{key} {query[:40]}",
+                input_message_content=InputTextMessageContent(f".{key} {query}"),
+            )
+        )
+    await update.inline_query.answer(results, cache_time=0, is_personal=True)
 
 
 # ---------- Speak-as-bot ----------

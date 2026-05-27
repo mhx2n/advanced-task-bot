@@ -41,6 +41,16 @@ CREATE TABLE IF NOT EXISTS speak_active (
     target_chat_id INTEGER,
     updated_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS custom_providers (
+    cmd TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    model TEXT NOT NULL,
+    enabled INTEGER DEFAULT 1,
+    created_at INTEGER,
+    updated_at INTEGER
+);
 """
 
 
@@ -202,3 +212,40 @@ async def get_speak_target(uid: int):
         async with db.execute("SELECT target_chat_id FROM speak_active WHERE user_id=?", (uid,)) as cur:
             row = await cur.fetchone()
             return row[0] if row else None
+
+
+# ---------- custom providers ----------
+async def add_custom_provider(cmd: str, name: str, base_url: str, api_key: str, model: str):
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO custom_providers(cmd,name,base_url,api_key,model,enabled,created_at,updated_at)
+               VALUES(?,?,?,?,?,1,?,?)
+               ON CONFLICT(cmd) DO UPDATE SET
+                   name=excluded.name,
+                   base_url=excluded.base_url,
+                   api_key=excluded.api_key,
+                   model=excluded.model,
+                   enabled=1,
+                   updated_at=excluded.updated_at
+            """,
+            (cmd, name, base_url, api_key, model, now, now),
+        )
+        await db.commit()
+
+
+async def remove_custom_provider(cmd: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM custom_providers WHERE cmd=?", (cmd,))
+        await db.commit()
+
+
+async def list_custom_providers(enabled_only: bool = True):
+    query = (
+        "SELECT cmd, name, base_url, api_key, model, enabled FROM custom_providers WHERE enabled=1 ORDER BY cmd"
+        if enabled_only else
+        "SELECT cmd, name, base_url, api_key, model, enabled FROM custom_providers ORDER BY cmd"
+    )
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(query) as cur:
+            return await cur.fetchall()

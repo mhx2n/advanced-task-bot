@@ -52,6 +52,9 @@ def _ydl_opts(outtmpl: str) -> dict:
         "socket_timeout": 30,
         "nocheckcertificate": True,
         "geo_bypass": True,
+        "extractor_args": {
+            "youtube": {"player_client": ["android", "ios", "web"], "player_skip": ["webpage"]},
+        },
     }
 
 
@@ -102,6 +105,18 @@ async def download(url: str) -> dict:
     except Exception:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
+
+
+def user_error_text(err: Exception) -> str:
+    msg = str(err or "Download failed").strip()
+    low = msg.lower()
+    if "sign in to confirm you're not a bot" in low:
+        return "YouTube blocked this request from the server IP. Try another link or retry later."
+    if "unable to extract video url" in low or "empty media response" in low:
+        return "This platform did not expose a downloadable video stream for that link. Try another public post/reel."
+    if "timed out" in low:
+        return "The remote site took too long to respond. Please try again."
+    return msg[:500]
 
 
 def cleanup(info: dict):
