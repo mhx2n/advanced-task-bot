@@ -949,6 +949,7 @@ USER_COMMANDS = [
     BotCommand("short", "Shorten a URL"),
     BotCommand("style", "Stylish text (40+ fonts)"),
     BotCommand("tr",    "Translate text (Mistral)"),
+    BotCommand("ocr",   "Extract text from image (Mistral)"),
     BotCommand("ping",  "Latency check"),
     BotCommand("help",  "Help (add a topic for AI summary)"),
 ]
