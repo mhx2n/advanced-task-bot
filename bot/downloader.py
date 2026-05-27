@@ -128,8 +128,15 @@ async def download(url: str) -> dict:
 def user_error_text(err: Exception) -> str:
     msg = str(err or "Download failed").strip()
     low = msg.lower()
-    if "sign in to confirm you're not a bot" in low:
-        return "YouTube blocked this request from the server IP. Try another link or retry later."
+    if "sign in to confirm you're not a bot" in low or "confirm you" in low:
+        return (
+            "YouTube is blocking the server IP with a bot-check.\n"
+            "Workarounds:\n"
+            "  • Try the link again in a minute.\n"
+            "  • Owner: export your browser cookies to cookies.txt and set "
+            "the env var YT_COOKIES_FILE=/path/to/cookies.txt, then /restart.\n"
+            "  • Or try a different public video / another platform."
+        )
     if "unable to extract video url" in low or "empty media response" in low:
         return "This platform did not expose a downloadable video stream for that link. Try another public post/reel."
     if "timed out" in low:
