@@ -596,8 +596,15 @@ async def cmd_addprovider(update: Update, context: ContextTypes.DEFAULT_TYPE):
     func = make_openai_compatible_provider(name, base_url, api_key, model)
     register(cmd, name, func)
     await db.add_custom_provider(cmd, name, base_url, api_key, model)
+    # Bind /command and .alias onto the running app immediately
+    try:
+        context.application.add_handler(CommandHandler(cmd, make_provider_handler(cmd)))
+    except Exception:
+        pass
     await setup_bot_commands(context.application)
-    await update.effective_message.reply_text(f"Provider added: /{cmd} and .{cmd}")
+    await update.effective_message.reply_text(
+        f"Provider added.\n• Command: /{cmd}\n• Dot alias: .{cmd}\n• Model: {model}"
+    )
 
 
 async def cmd_delprovider(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1044,5 +1051,6 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("restart",    cmd_restart))
 
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(InlineQueryHandler(on_inline_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)

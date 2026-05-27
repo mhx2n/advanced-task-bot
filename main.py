@@ -14,7 +14,10 @@ from telegram.ext import ApplicationBuilder
 
 from bot.config import BOT_TOKEN, PORT
 from bot.db import init_db
-from bot.handlers import register_handlers, setup_bot_commands, notify_restart_complete
+from bot.handlers import (
+    register_handlers, setup_bot_commands, notify_restart_complete,
+    load_custom_providers,
+)
 from bot.health import run_in_thread
 
 logging.basicConfig(
@@ -36,6 +39,9 @@ async def _amain():
         .concurrent_updates(True)   # multi-user concurrency
         .build()
     )
+    # Populate custom providers in REGISTRY BEFORE wiring handlers so each
+    # custom provider gets its own /command and .alias automatically.
+    await load_custom_providers(None)
     register_handlers(app)
 
     # Health server (non-blocking, daemon thread)
@@ -52,7 +58,9 @@ async def _amain():
     await app.start()
     await app.updater.start_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "callback_query", "edited_message"],
+        allowed_updates=[
+            "message", "callback_query", "edited_message", "inline_query",
+        ],
     )
     log.info("Polling started. Press Ctrl+C to stop.")
 
