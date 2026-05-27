@@ -1198,6 +1198,7 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("ban",        cmd_ban))
     app.add_handler(CommandHandler("unban",      cmd_unban))
     app.add_handler(CommandHandler("announce",   cmd_announce))
+    app.add_handler(CommandHandler("cancel",     cmd_cancel))
     app.add_handler(CommandHandler("live",       cmd_live))
     app.add_handler(CommandHandler("speak",      cmd_speak))
     app.add_handler(CommandHandler("grant",      cmd_grant))
