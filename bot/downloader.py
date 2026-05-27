@@ -52,7 +52,10 @@ def detect_url(text: str) -> Optional[str]:
     if not m:
         return None
     url = m.group(0).rstrip(").,]>")
-    if any(h in url.lower() for h in SUPPORTED_HOSTS):
+    host = (urlparse(url).netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if any(host == h or host.endswith(f".{h}") for h in SUPPORTED_HOSTS):
         return url
     return None
 
