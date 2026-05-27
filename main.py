@@ -14,7 +14,7 @@ from telegram.ext import ApplicationBuilder
 
 from bot.config import BOT_TOKEN, PORT
 from bot.db import init_db
-from bot.handlers import register_handlers, setup_bot_commands
+from bot.handlers import register_handlers, setup_bot_commands, notify_restart_complete
 from bot.health import run_in_thread
 
 logging.basicConfig(
@@ -45,6 +45,7 @@ async def _amain():
 
     # Register Telegram command menus (per-scope: user vs owner)
     await setup_bot_commands(app)
+    await notify_restart_complete(app)
 
     # Drop pending updates from previous run to avoid double-processing.
     await app.initialize()
