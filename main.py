@@ -39,12 +39,10 @@ async def _amain():
         .concurrent_updates(True)   # multi-user concurrency
         .build()
     )
-    # Load any owner-added custom providers BEFORE register_handlers so they
-    # are bound as /commands too.
+    # Populate custom providers in REGISTRY BEFORE wiring handlers so each
+    # custom provider gets its own /command and .alias automatically.
     await load_custom_providers(None)
     register_handlers(app)
-    # Re-bind handlers for custom providers onto the running app
-    await load_custom_providers(app)
 
     # Health server (non-blocking, daemon thread)
     me = await app.bot.get_me()
