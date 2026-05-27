@@ -4,15 +4,17 @@ import os
 import time
 import traceback
 from collections import defaultdict
+from uuid import uuid4
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
+    InlineQueryResultArticle, InputTextMessageContent,
 )
 from telegram.constants import ChatAction, ChatMemberStatus, ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters,
+    ContextTypes, InlineQueryHandler, filters,
 )
 
 from . import db, downloader
@@ -62,14 +64,14 @@ async def force_join_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
 
 
 async def send_md(target_msg_or_chat, text: str, context=None, **kw):
-    """Send a (possibly long) message, trying Markdown first then plain."""
+    """Send a (possibly long) message with safe HTML formatting."""
     text = text or ""
     chunks = list(chunk_text(text))
     first = None
     for c in chunks:
         try:
             m = await target_msg_or_chat.reply_text(
-                c, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True, **kw,
+                c, parse_mode=ParseMode.HTML, disable_web_page_preview=True, **kw,
             )
         except Exception:
             m = await target_msg_or_chat.reply_text(
@@ -84,7 +86,7 @@ async def safe_edit(message, text: str, reply_markup=None):
     chunks = list(chunk_text(text))
     try:
         await message.edit_text(
-            chunks[0], parse_mode=ParseMode.MARKDOWN,
+            chunks[0], parse_mode=ParseMode.HTML,
             disable_web_page_preview=True, reply_markup=reply_markup,
         )
     except Exception:
@@ -96,10 +98,23 @@ async def safe_edit(message, text: str, reply_markup=None):
             return
     for extra in chunks[1:]:
         try:
-            await message.reply_text(extra, parse_mode=ParseMode.MARKDOWN,
+            await message.reply_text(extra, parse_mode=ParseMode.HTML,
                                      disable_web_page_preview=True)
         except Exception:
             await message.reply_text(clean_text(extra), disable_web_page_preview=True)
+
+
+async def stream_edit(message, text: str, reply_markup=None):
+    text = text or ""
+    if len(text) < 500:
+        await safe_edit(message, text, reply_markup=reply_markup)
+        return
+    steps = 5
+    for i in range(1, steps + 1):
+        chunk = text[: max(1, int(len(text) * i / steps))]
+        await safe_edit(message, chunk, reply_markup=reply_markup if i == steps else None)
+        if i != steps:
+            await asyncio.sleep(0.35)
 
 
 # ============================================================
