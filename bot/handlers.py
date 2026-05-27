@@ -967,6 +967,8 @@ OWNER_EXTRA = [
     BotCommand("grant",      "Grant speak access"),
     BotCommand("revoke",     "Revoke speak access"),
     BotCommand("restart",    "Restart the bot process"),
+    BotCommand("mkey",       "Set Mistral API key"),
+    BotCommand("mlimit",     "Set Mistral daily per-user limit"),
 ]
 
 
