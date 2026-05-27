@@ -70,7 +70,12 @@ def _ydl_opts(outtmpl: str) -> dict:
         },
     }
     # Optional: owner can drop a cookies.txt path via env to bypass bot-checks.
+    # Also checks a default youtube_cookies.txt in project root.
     cookies = os.getenv("YT_COOKIES_FILE", "").strip()
+    if not cookies:
+        default = os.path.join(os.path.dirname(os.path.dirname(__file__)), "youtube_cookies.txt")
+        if os.path.exists(default):
+            cookies = default
     if cookies and os.path.exists(cookies):
         opts["cookiefile"] = cookies
     return opts
