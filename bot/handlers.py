@@ -22,6 +22,7 @@ from .config import OWNER_ID, FORCE_JOIN_CHANNEL
 from .providers import REGISTRY, register as register_provider, make_openai_compatible_provider
 from .utils import clean_text, format_ai_answer, chunk_text, escape_html, human_size
 from .keycheck import inspect_key, try_model
+from .tools import textenc as _textenc
 
 
 _HISTORY: dict = defaultdict(list)
@@ -934,6 +935,10 @@ USER_COMMANDS = [
     BotCommand("key",   "Inspect an API key"),
     BotCommand("tryke", "Try a model with last key"),
     BotCommand("dl",    "Download YT/FB/IG/TikTok video"),
+    BotCommand("en",    "Encode text (Base64/Hex/Binary/…)"),
+    BotCommand("de",    "Decode text from any format"),
+    BotCommand("text",  "Transform text case/reverse"),
+    BotCommand("wc",    "Word & character count"),
     BotCommand("ping",  "Latency check"),
     BotCommand("help",  "Help (add a topic for AI summary)"),
 ]
@@ -1049,6 +1054,9 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("grant",      cmd_grant))
     app.add_handler(CommandHandler("revoke",     cmd_revoke))
     app.add_handler(CommandHandler("restart",    cmd_restart))
+
+    # Text & Encoding tool-pack (own callbacks scoped via pattern)
+    _textenc.register(app)
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(InlineQueryHandler(on_inline_query))
