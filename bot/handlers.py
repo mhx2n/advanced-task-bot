@@ -442,7 +442,7 @@ async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
         try: await status.edit_text("Download timed out.")
         except Exception: pass
     except Exception as e:
-        try: await status.edit_text(f"Download failed:\n{e}")
+        try: await status.edit_text(f"Download failed:\n{downloader.user_error_text(e)}")
         except Exception: pass
         await db.log("ERROR", update.effective_user.id, "dl", f"{url} | {e}")
     finally:
