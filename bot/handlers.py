@@ -947,6 +947,7 @@ USER_COMMANDS = [
     BotCommand("enh",   "Enhance a photo"),
     BotCommand("res",   "Resize image (presets)"),
     BotCommand("short", "Shorten a URL"),
+    BotCommand("style", "Stylish text (40+ fonts)"),
     BotCommand("ping",  "Latency check"),
     BotCommand("help",  "Help (add a topic for AI summary)"),
 ]
