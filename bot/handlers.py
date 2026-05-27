@@ -961,6 +961,7 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("speak",      cmd_speak))
     app.add_handler(CommandHandler("grant",      cmd_grant))
     app.add_handler(CommandHandler("revoke",     cmd_revoke))
+    app.add_handler(CommandHandler("restart",    cmd_restart))
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
