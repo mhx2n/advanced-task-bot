@@ -14,7 +14,7 @@ from telegram.ext import ApplicationBuilder
 
 from bot.config import BOT_TOKEN, PORT
 from bot.db import init_db
-from bot.handlers import register_handlers
+from bot.handlers import register_handlers, setup_bot_commands
 from bot.health import run_in_thread
 
 logging.basicConfig(
@@ -42,6 +42,9 @@ async def _amain():
     me = await app.bot.get_me()
     run_in_thread(PORT, {"username": me.username, "id": me.id})
     log.info("Health server on :%s | Bot @%s started", PORT, me.username)
+
+    # Register Telegram command menus (per-scope: user vs owner)
+    await setup_bot_commands(app)
 
     # Drop pending updates from previous run to avoid double-processing.
     await app.initialize()
