@@ -18,7 +18,9 @@ import shutil
 import tempfile
 import time
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
+import requests
 import yt_dlp
 
 # Telegram bot upload cap (~50 MB for regular bots)
@@ -36,6 +38,12 @@ _UA_IOS = (
     "Mobile/15E148 Safari/604.1"
 )
 
+_UA_DESKTOP = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
+
 
 def detect_url(text: str) -> Optional[str]:
     if not text:
@@ -44,7 +52,10 @@ def detect_url(text: str) -> Optional[str]:
     if not m:
         return None
     url = m.group(0).rstrip(").,]>")
-    if any(h in url.lower() for h in SUPPORTED_HOSTS):
+    host = (urlparse(url).netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if any(host == h or host.endswith(f".{h}") for h in SUPPORTED_HOSTS):
         return url
     return None
 
@@ -60,7 +71,46 @@ def _cookies_path() -> Optional[str]:
     return cookies if cookies and os.path.exists(cookies) else None
 
 
-def _ydl_base() -> dict:
+def platform_from_url(url: str) -> str:
+    host = (urlparse(url or "").netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host.endswith("youtube.com") or host == "youtu.be":
+        return "youtube"
+    if host.endswith("tiktok.com"):
+        return "tiktok"
+    if host.endswith("instagram.com"):
+        return "instagram"
+    if host.endswith("facebook.com") or host == "fb.watch":
+        return "facebook"
+    if host.endswith("twitter.com") or host == "x.com":
+        return "twitter"
+    return "generic"
+
+
+def _normalize_url(url: str) -> str:
+    low = (url or "").lower()
+    if "vt.tiktok.com/" not in low and "vm.tiktok.com/" not in low:
+        return url
+    try:
+        resp = requests.get(
+            url,
+            headers={
+                "User-Agent": _UA_DESKTOP,
+                "Referer": "https://www.tiktok.com/",
+            },
+            timeout=15,
+            allow_redirects=True,
+        )
+        final_url = (resp.url or "").strip()
+        if final_url and "tiktok.com/" in final_url.lower():
+            return final_url
+    except Exception:
+        pass
+    return url
+
+
+def _ydl_base(url: str) -> dict:
     opts: dict = {
         "noplaylist": True,
         "quiet": True,
@@ -72,20 +122,28 @@ def _ydl_base() -> dict:
         "geo_bypass": True,
         "concurrent_fragment_downloads": 4,
         "merge_output_format": "mp4",
-        "extractor_args": {
+        "http_headers": {
+            "User-Agent": _UA_DESKTOP,
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    }
+    platform = platform_from_url(url)
+    if platform == "youtube":
+        opts["http_headers"]["User-Agent"] = _UA_IOS
+        opts["extractor_args"] = {
             "youtube": {
                 "player_client": ["tv_embedded", "ios", "mweb", "web_safari"],
                 "player_skip": ["configs"],
             },
-        },
-        "http_headers": {
-            "User-Agent": _UA_IOS,
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    }
-    cookies = _cookies_path()
-    if cookies:
-        opts["cookiefile"] = cookies
+        }
+        cookies = _cookies_path()
+        if cookies:
+            opts["cookiefile"] = cookies
+    elif platform == "tiktok":
+        opts["http_headers"].update({
+            "Referer": "https://www.tiktok.com/",
+            "Origin": "https://www.tiktok.com",
+        })
     return opts
 
 
@@ -133,7 +191,8 @@ def _make_progress_hook(cb: Optional[Callable[[dict], None]]):
 
 def _probe(url: str) -> dict:
     """Extract metadata without downloading — used to skip oversized files."""
-    opts = _ydl_base()
+    url = _normalize_url(url)
+    opts = _ydl_base(url)
     opts["skip_download"] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -153,6 +212,7 @@ def _pick_best_size(info: dict) -> int:
 
 
 def _sync_download(url: str, workdir: str, progress: Optional[Callable] = None) -> dict:
+    url = _normalize_url(url)
     outtmpl = os.path.join(workdir, "%(id).40s.%(ext)s")
 
     # Pre-flight probe (non-fatal if it fails — some sites block extraction-only).
@@ -171,7 +231,7 @@ def _sync_download(url: str, workdir: str, progress: Optional[Callable] = None) 
     hook = _make_progress_hook(progress)
 
     for tier_idx, fmt in enumerate(_FORMAT_LADDER):
-        opts = _ydl_base()
+        opts = _ydl_base(url)
         opts["outtmpl"] = outtmpl
         opts["format"] = fmt
         opts["format_sort"] = ["+size", "+br", "+res", "+fps"]
@@ -228,7 +288,10 @@ def _sync_download(url: str, workdir: str, progress: Optional[Callable] = None) 
             last_err = e
             continue
 
-    raise last_err or RuntimeError("Download failed after all fallbacks.")
+    platform = platform_from_url(url)
+    if last_err:
+        raise RuntimeError(f"[{platform}] {last_err}")
+    raise RuntimeError(f"[{platform}] Download failed after all fallbacks.")
 
 
 async def download(url: str, progress: Optional[Callable] = None) -> dict:
@@ -253,12 +316,28 @@ async def download(url: str, progress: Optional[Callable] = None) -> dict:
 def user_error_text(err: Exception) -> str:
     msg = str(err or "Download failed").strip()
     low = msg.lower()
-    if "sign in to confirm" in low or "confirm you" in low:
+    platform = "generic"
+    m = re.match(r"^\[([a-z0-9_:-]+)\]\s*(.*)$", msg, flags=re.IGNORECASE)
+    if m:
+        platform = m.group(1).lower()
+        low = m.group(2).lower()
+    if ("sign in to confirm" in low or "confirm you" in low) and platform == "youtube":
         return (
             "YouTube is asking for sign-in verification on the server.\n"
             "Please try a different public link, or ask the owner to refresh "
             "the cookies file."
         )
+    if platform == "tiktok":
+        if "unable to extract webpage video data" in low or "empty media response" in low:
+            return (
+                "TikTok blocked this short link or did not expose the video stream right now.\n"
+                "Try opening the link once in a browser, copy the full TikTok video URL, then send that link again."
+            )
+        if "login required" in low or "private" in low or "status code 403" in low or "forbidden" in low:
+            return (
+                "This TikTok post is restricted from the server right now.\n"
+                "Try a public full video link, or refresh TikTok-access cookies/headers on the server."
+            )
     if "login required" in low or "private" in low:
         return "This post is private or requires login."
     if "age" in low and "restricted" in low:
