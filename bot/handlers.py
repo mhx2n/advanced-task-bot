@@ -1216,5 +1216,13 @@ def register_handlers(app: Application):
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(InlineQueryHandler(on_inline_query))
+
+    # Catches the owner's next message of ANY type after arming a broadcast.
+    # Must run BEFORE on_text (lower group number = higher priority).
+    app.add_handler(
+        MessageHandler(filters.ALL & ~filters.COMMAND, on_any_owner_message),
+        group=-1,
+    )
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
