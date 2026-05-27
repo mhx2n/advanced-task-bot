@@ -10,6 +10,7 @@ from telegram.constants import ChatAction
 from . import _mistral
 from ..config import OWNER_ID
 from .. import db
+from ..utils import safe_user_error
 
 
 # ISO-ish language codes the bot understands explicitly. Anything else is passed
@@ -141,9 +142,9 @@ async def cmd_tr(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await placeholder.edit_text(body, parse_mode="HTML", disable_web_page_preview=True)
         except Exception:
             await placeholder.edit_text(out)
-    except Exception as e:
+    except Exception:
         try:
-            await placeholder.edit_text(f"Translation failed: {e}")
+            await placeholder.edit_text(safe_user_error("Translation"))
         except Exception:
             pass
 

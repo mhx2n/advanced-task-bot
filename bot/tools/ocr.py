@@ -144,8 +144,8 @@ async def cmd_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     max_tokens=1800, temperature=0.2, timeout=60,
                 )
                 translated = (translated or "").strip()
-            except Exception as e:
-                translated = f"[translation failed: {e}]"
+            except Exception:
+                translated = "[translation unavailable]"
 
         # Build output
         if translated:
@@ -181,9 +181,9 @@ async def cmd_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         disable_web_page_preview=True)
         except Exception:
             await placeholder.edit_text(raw)
-    except Exception as e:
+    except Exception:
         try:
-            await placeholder.edit_text(f"OCR failed: {e}")
+            await placeholder.edit_text(safe_user_error("OCR"))
         except Exception:
             pass
 

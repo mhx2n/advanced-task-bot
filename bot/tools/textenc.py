@@ -259,7 +259,7 @@ async def on_tx_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         out = func(src)
     except Exception as e:
-        out = f"[error: {e}]"
+        out = "[conversion failed]"
     body = (f"<b>Format:</b> <code>{html.escape(label)}</code>\n"
             f"<b>Source:</b> <code>{html.escape(src[:200])}</code>\n\n"
             f"<b>Result:</b>\n<pre>{html.escape(out[:3500])}</pre>")
