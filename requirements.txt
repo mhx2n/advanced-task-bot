@@ -7,3 +7,4 @@ requests==2.32.3
 beautifulsoup4==4.12.3
 websocket-client==1.8.0
 python-dotenv==1.0.1
+yt-dlp==2025.1.15
