@@ -935,8 +935,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ids = await db.all_user_ids()
             await q.edit_message_text(f"Active users: {len(ids)}", reply_markup=owner_kb()); return
         if sub == "announce":
-            _AWAIT_INPUT[uid] = ("announce", None)
-            await q.edit_message_text("Send the announcement text now.", reply_markup=owner_kb()); return
+            _PENDING_ANNOUNCE.add(uid)
+            await q.edit_message_text(
+                "Send the announcement now — it can be any type:\n"
+                "text, photo, video, audio, voice, document, GIF, or sticker "
+                "(with or without caption).\n\n"
+                "Send /cancel to abort.",
+                reply_markup=owner_kb(),
+            ); return
         if sub == "speak":
             _AWAIT_INPUT[uid] = ("speak_to", None)
             await q.edit_message_text(
