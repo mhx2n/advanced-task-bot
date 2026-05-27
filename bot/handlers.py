@@ -542,17 +542,50 @@ async def cmd_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     chat_id = update.effective_chat.id
-    status = await update.effective_message.reply_text("Queued. Downloading...")
+    status = await update.effective_message.reply_text("Queued. Preparing download...")
     info = None
+    loop = asyncio.get_running_loop()
+    last_edit = {"t": 0.0, "text": ""}
+
+    def _fmt_bytes(n: int) -> str:
+        if n <= 0: return "?"
+        for u in ("B", "KB", "MB", "GB"):
+            if n < 1024: return f"{n:.1f} {u}"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+    def _on_progress(p: dict):
+        s = p.get("status")
+        if s == "downloading":
+            dl = p.get("downloaded", 0); tot = p.get("total", 0)
+            pct = (dl / tot * 100) if tot else 0
+            sp = p.get("speed", 0) or 0
+            eta = p.get("eta", 0) or 0
+            txt = (
+                f"Downloading… {pct:.0f}%\n"
+                f"{_fmt_bytes(dl)} / {_fmt_bytes(tot)}  •  {_fmt_bytes(sp)}/s\n"
+                f"ETA: {eta}s"
+            )
+        elif s == "finished":
+            txt = "Download complete. Processing…"
+        else:
+            return
+        if txt == last_edit["text"]:
+            return
+        last_edit["text"] = txt
+        async def _do():
+            try: await status.edit_text(txt)
+            except Exception: pass
+        asyncio.run_coroutine_threadsafe(_do(), loop)
+
     try:
         async with _DOWNLOAD_SEM:
             await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+            info = await asyncio.wait_for(
+                downloader.download(url, progress=_on_progress), timeout=420,
+            )
             try:
-                await status.edit_text("Downloading video...")
-            except Exception: pass
-            info = await asyncio.wait_for(downloader.download(url), timeout=300)
-            try:
-                await status.edit_text(f"Uploading ({human_size(info['size'])})...")
+                await status.edit_text(f"Uploading ({human_size(info['size'])})…")
             except Exception: pass
             caption = clean_text(
                 f"{info['title'] or 'Video'}\n{info['uploader']} • {human_size(info['size'])}"
@@ -561,14 +594,16 @@ async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
                 await context.bot.send_video(
                     chat_id=chat_id, video=f, caption=caption,
                     supports_streaming=True,
-                    write_timeout=180, read_timeout=180,
+                    duration=info.get("duration") or None,
+                    write_timeout=240, read_timeout=240,
                 )
             try: await status.delete()
             except Exception: pass
         await db.log("INFO", update.effective_user.id, "dl", url[:200])
     except asyncio.TimeoutError:
-        try: await status.edit_text("Download timed out.")
+        try: await status.edit_text("Download timed out. Please try again.")
         except Exception: pass
+        await db.log("ERROR", update.effective_user.id, "dl", f"{url} | timeout")
     except Exception as e:
         try: await status.edit_text(f"Download failed:\n{downloader.user_error_text(e)}")
         except Exception: pass
