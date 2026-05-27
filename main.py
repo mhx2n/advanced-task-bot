@@ -45,6 +45,7 @@ async def _amain():
 
     # Register Telegram command menus (per-scope: user vs owner)
     await setup_bot_commands(app)
+    await notify_restart_complete(app)
 
     # Drop pending updates from previous run to avoid double-processing.
     await app.initialize()
