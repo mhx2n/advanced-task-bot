@@ -1,170 +1,262 @@
 import asyncio
 import json
+import os
 import time
 import traceback
 from collections import defaultdict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction, ChatMemberStatus
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
+    FSInputFile,
+)
+from telegram.constants import ChatAction, ChatMemberStatus, ParseMode
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters,
 )
 
-from . import db
-from .config import OWNER_ID, FORCE_JOIN_CHANNEL, PUBLIC_URL
+from . import db, downloader
+from .config import OWNER_ID, FORCE_JOIN_CHANNEL
 from .providers import REGISTRY
-from .utils import clean_text, chunk_text, escape_html
+from .utils import clean_text, format_ai_answer, chunk_text, escape_html, human_size
 from .keycheck import inspect_key, try_model
 
 
-# In-memory ephemeral context: per (chat_id, root_message_id) -> history list
 _HISTORY: dict = defaultdict(list)
-_PENDING_KEY: dict = {}  # user_id -> api_key (for /tryke flow)
+_PENDING_KEY: dict = {}     # user_id -> last inspected api key
+_AWAIT_INPUT: dict = {}     # user_id -> ("key"|"download"|"tryke"|"announce"|"speak_to"|"grant"|"revoke")
+_DOWNLOAD_SEM = asyncio.Semaphore(3)  # cap concurrent downloads
 
 
-# ---------- Helpers ----------
+# ============================================================
+# Helpers
+# ============================================================
 def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
 
 
 async def force_join_ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Enforce channel membership before any non-owner can use the bot."""
-    if not FORCE_JOIN_CHANNEL:
+    from . import config as cfg
+    channel = cfg.FORCE_JOIN_CHANNEL or FORCE_JOIN_CHANNEL
+    if not channel:
         return True
     user = update.effective_user
     if not user or is_owner(user.id):
         return True
     try:
-        member = await context.bot.get_chat_member(f"@{FORCE_JOIN_CHANNEL}", user.id)
-        if member.status in (
-            ChatMemberStatus.MEMBER, ChatMemberStatus.OWNER,
-            ChatMemberStatus.ADMINISTRATOR,
-        ):
+        member = await context.bot.get_chat_member(f"@{channel}", user.id)
+        if member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.OWNER,
+                             ChatMemberStatus.ADMINISTRATOR):
             return True
     except Exception:
         pass
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Join Channel", url=f"https://t.me/{FORCE_JOIN_CHANNEL}")],
+        [InlineKeyboardButton("Join Channel", url=f"https://t.me/{channel}")],
         [InlineKeyboardButton("I have joined", callback_data="verify_join")],
     ])
     await update.effective_message.reply_text(
-        "Access restricted.\n\nYou must join our official channel to use this bot.\n"
-        "Tap Join, then press I have joined to verify.",
+        "Access restricted. You must join our channel to use this bot.",
         reply_markup=kb,
     )
     return False
 
 
-async def safe_reply(update: Update, text: str, **kw):
-    text = clean_text(text)
+async def send_md(target_msg_or_chat, text: str, context=None, **kw):
+    """Send a (possibly long) message, trying Markdown first then plain."""
+    text = text or ""
+    chunks = list(chunk_text(text))
     first = None
-    for chunk in chunk_text(text):
-        msg = await update.effective_message.reply_text(chunk, **kw)
-        first = first or msg
+    for c in chunks:
+        try:
+            m = await target_msg_or_chat.reply_text(
+                c, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True, **kw,
+            )
+        except Exception:
+            m = await target_msg_or_chat.reply_text(
+                clean_text(c), disable_web_page_preview=True, **kw,
+            )
+        first = first or m
     return first
 
 
-async def safe_edit(message, text: str):
-    text = clean_text(text)
+async def safe_edit(message, text: str, reply_markup=None):
+    text = text or ""
     chunks = list(chunk_text(text))
     try:
-        await message.edit_text(chunks[0])
+        await message.edit_text(
+            chunks[0], parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True, reply_markup=reply_markup,
+        )
     except Exception:
-        return
+        try:
+            await message.edit_text(
+                clean_text(chunks[0]), disable_web_page_preview=True, reply_markup=reply_markup,
+            )
+        except Exception:
+            return
     for extra in chunks[1:]:
-        await message.reply_text(extra)
+        try:
+            await message.reply_text(extra, parse_mode=ParseMode.MARKDOWN,
+                                     disable_web_page_preview=True)
+        except Exception:
+            await message.reply_text(clean_text(extra), disable_web_page_preview=True)
 
 
-# ---------- Commands ----------
+# ============================================================
+# Main menus (inline keyboards)
+# ============================================================
+def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("AI Providers", callback_data="m:providers"),
+         InlineKeyboardButton("API Key Tools", callback_data="m:keytools")],
+        [InlineKeyboardButton("Video Downloader", callback_data="m:dl"),
+         InlineKeyboardButton("Help / About", callback_data="m:help")],
+    ]
+    if is_owner(uid):
+        rows.append([InlineKeyboardButton("Owner Panel", callback_data="m:owner")])
+    return InlineKeyboardMarkup(rows)
+
+
+def providers_kb() -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for k, (name, _) in REGISTRY.items():
+        row.append(InlineKeyboardButton(name, callback_data=f"pick:{k}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("« Back", callback_data="m:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def keytools_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Inspect API Key", callback_data="kt:inspect")],
+        [InlineKeyboardButton("Try Model (last key)", callback_data="kt:try")],
+        [InlineKeyboardButton("« Back", callback_data="m:home")],
+    ])
+
+
+def dl_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Send Video URL", callback_data="dl:ask")],
+        [InlineKeyboardButton("« Back", callback_data="m:home")],
+    ])
+
+
+def owner_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Stats", callback_data="ow:stats"),
+         InlineKeyboardButton("Logs", callback_data="ow:logs")],
+        [InlineKeyboardButton("Users", callback_data="ow:users"),
+         InlineKeyboardButton("Announce", callback_data="ow:announce")],
+        [InlineKeyboardButton("Speak as Bot", callback_data="ow:speak"),
+         InlineKeyboardButton("Speak Grants", callback_data="ow:grants")],
+        [InlineKeyboardButton("Live Response Toggle", callback_data="ow:live")],
+        [InlineKeyboardButton("Set Channel", callback_data="ow:setch")],
+        [InlineKeyboardButton("« Back", callback_data="m:home")],
+    ])
+
+
+def back_home_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("« Main Menu", callback_data="m:home")]])
+
+
+# ============================================================
+# Commands
+# ============================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.upsert_user(update.effective_user)
     if not await force_join_ok(update, context):
         return
     name = escape_html(update.effective_user.first_name or "there")
     txt = (
-        f"Welcome, {name}.\n\n"
-        "This is an advanced multi-AI assistant.\n"
-        "Available providers:\n"
+        f"*Welcome, {name}.*\n\n"
+        "Advanced multi-AI assistant.\n"
+        "• Chat with multiple AI providers\n"
+        "• Inspect any AI API key (status, models, limits)\n"
+        "• Download videos from YouTube, Facebook, Instagram, TikTok\n\n"
+        "Tap a button below to begin."
     )
-    for k, (n, _) in REGISTRY.items():
-        txt += f"  .{k}  —  {n}\n"
-    txt += (
-        "\nUsage:\n"
-        "  .g your question      (Gemini)\n"
-        "  .pr your question     (Perplexity)\n"
-        "  .co your question     (Copilot)\n"
-        "  .key <API_KEY>        (inspect any provider key)\n\n"
-        "Reply to any bot answer to continue the same conversation.\n"
-        "Use /help to see all user commands."
+    await update.effective_message.reply_text(
+        txt, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(update.effective_user.id),
     )
-    await safe_reply(update, txt)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await force_join_ok(update, context):
+    """If args given, use AI to summarize that feature/provider for the user."""
+    if not await force_join_ok(update, context): return
+    args = " ".join(context.args).strip() if context.args else ""
+    if not args:
+        lines = [
+            "*Help Center*\n",
+            "User commands:",
+            "/start  — main menu (buttons)",
+            "/menu   — AI provider menu",
+            "/key    — inspect API key",
+            "/dl <url>  — download video (YT/FB/IG/TikTok)",
+            "/ping   — latency",
+            "/help <topic>  — AI-summarized help on any topic\n",
+            "Tip: reply to any bot answer to continue that chat.",
+        ]
+        await send_md(update.effective_message, "\n".join(lines))
         return
-    lines = [
-        "User Commands",
-        "",
-        "/start   — Welcome and provider list",
-        "/help    — This message",
-        "/menu    — Provider menu",
-        "/ping    — Latency check",
-        "/key <API_KEY>   — Inspect API key (models, limits, expiry)",
-        "/tryke <model> <prompt>  — Try a model using the last inspected key",
-        "",
-        "AI Shortcuts (both . and / work):",
-    ]
-    for k, (n, _) in REGISTRY.items():
-        lines.append(f"  .{k} or /{k}  —  {n}")
-    lines.append("\nReply to any bot answer to continue that chat.")
-    await safe_reply(update, "\n".join(lines))
+    # AI-summarized help
+    feature_doc = (
+        "You are the in-bot help assistant. Summarize ONLY what THIS bot offers:\n"
+        "Providers: Gemini (.g), Perplexity (.pr), Copilot (.co) — free, no key needed.\n"
+        "API Key Inspector: /key <KEY> works for OpenAI, Anthropic, Gemini, Groq, "
+        "OpenRouter, Cohere, DeepSeek, xAI, Together AI. Then /tryke <model> <prompt>.\n"
+        "Video Downloader: /dl <url> for YouTube, Facebook, Instagram, TikTok (under 50MB).\n"
+        "Conversation: reply to any bot answer to continue with the same model.\n"
+        "Owner-only: /owner panel with stats, logs, broadcast, speak-as-bot, live-response toggle.\n"
+        f"User asked: {args}\n"
+        "Reply in the user's language, concise, organized with bullets. No emojis."
+    )
+    placeholder = await update.effective_message.reply_text("Thinking...")
+    try:
+        _, fn = REGISTRY.get("g", (None, None))
+        if not fn:
+            await safe_edit(placeholder, "Help engine unavailable.")
+            return
+        ans = await asyncio.wait_for(fn(feature_doc, []), timeout=60)
+        await safe_edit(placeholder, format_ai_answer(ans))
+    except Exception as e:
+        await safe_edit(placeholder, f"Help failed: {e}")
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await force_join_ok(update, context):
-        return
-    buttons = []
-    row = []
-    for k, (name, _) in REGISTRY.items():
-        row.append(InlineKeyboardButton(name, callback_data=f"pick:{k}"))
-        if len(row) == 2:
-            buttons.append(row); row = []
-    if row:
-        buttons.append(row)
-    buttons.append([InlineKeyboardButton("API Key Inspector", callback_data="info:keycheck")])
+    if not await force_join_ok(update, context): return
     await update.effective_message.reply_text(
-        "Select an AI provider:", reply_markup=InlineKeyboardMarkup(buttons)
+        "Main menu:", reply_markup=main_menu_kb(update.effective_user.id),
     )
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = time.time()
     m = await update.effective_message.reply_text("Pinging...")
-    dt = (time.time() - t) * 1000
-    await m.edit_text(f"Pong  •  {dt:.0f} ms")
+    await m.edit_text(f"Pong  •  {(time.time()-t)*1000:.0f} ms")
 
 
-# ---------- AI call ----------
+# ============================================================
+# AI provider call
+# ============================================================
 async def _call_provider(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          provider_key: str, prompt: str):
-    if not await force_join_ok(update, context):
-        return
+    if not await force_join_ok(update, context): return
     if not prompt.strip():
-        await safe_reply(update, "Please provide a question after the command.")
+        await update.effective_message.reply_text("Please provide a question after the command.")
         return
-
     name, fn = REGISTRY[provider_key]
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
-    # Determine session root: if user replied to a previous bot message, reuse its history.
     root_id = None
     rep = update.effective_message.reply_to_message
     if rep and rep.from_user and rep.from_user.id == context.bot.id:
         sess = await db.get_session(update.effective_chat.id, rep.message_id)
         if sess:
-            provider_key = sess[0]  # keep original provider when replying
+            provider_key = sess[0]
             name, fn = REGISTRY.get(provider_key, (name, fn))
             try:
                 _HISTORY[(update.effective_chat.id, rep.message_id)] = json.loads(sess[1])
@@ -175,26 +267,38 @@ async def _call_provider(update: Update, context: ContextTypes.DEFAULT_TYPE,
     history_key = (update.effective_chat.id, root_id) if root_id else None
     history = _HISTORY.get(history_key, []) if history_key else []
 
-    placeholder = await update.effective_message.reply_text(f"{name} is thinking...")
-    try:
-        answer = await asyncio.wait_for(fn(prompt, history), timeout=120)
-        answer = clean_text(answer) or "No content returned."
-        await safe_edit(placeholder, f"{name}\n\n{answer}")
+    live = (await db.get_setting("live_response", "on")) == "on"
+    placeholder = None
+    if live:
+        placeholder = await update.effective_message.reply_text(f"{name} is thinking...")
 
-        # Persist session keyed on placeholder.message_id so replies continue.
-        new_root = root_id or placeholder.message_id
+    try:
+        answer = await asyncio.wait_for(fn(prompt, history), timeout=180)
+        answer_fmt = format_ai_answer(answer) or "No content returned."
+        body = f"*{name}*\n\n{answer_fmt}"
+        if placeholder:
+            await safe_edit(placeholder, body)
+            sent = placeholder
+        else:
+            sent = await send_md(update.effective_message, body)
+
+        new_root = root_id or sent.message_id
         hist = _HISTORY[(update.effective_chat.id, new_root)]
-        hist.append({"q": prompt, "a": answer[:4000]})
+        hist.append({"q": prompt, "a": (answer or "")[:4000]})
         _HISTORY[(update.effective_chat.id, new_root)] = hist[-10:]
         await db.save_session(update.effective_chat.id, new_root, provider_key,
                               json.dumps(_HISTORY[(update.effective_chat.id, new_root)]))
         await db.log("INFO", update.effective_user.id, provider_key, prompt[:200])
     except asyncio.TimeoutError:
-        await safe_edit(placeholder, f"{name} timed out. Please try again.")
+        msg = f"{name} timed out. Please retry."
+        if placeholder: await safe_edit(placeholder, msg)
+        else: await update.effective_message.reply_text(msg)
         await db.log("ERROR", update.effective_user.id, provider_key, "timeout")
     except Exception as e:
         tb = traceback.format_exc(limit=2)
-        await safe_edit(placeholder, f"{name} error.\n\n{e}")
+        msg = f"{name} error.\n\n`{e}`"
+        if placeholder: await safe_edit(placeholder, msg)
+        else: await send_md(update.effective_message, msg)
         await db.log("ERROR", update.effective_user.id, provider_key, f"{e}\n{tb}")
 
 
@@ -202,111 +306,159 @@ def make_provider_handler(key: str):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.upsert_user(update.effective_user)
         text = update.effective_message.text or ""
-        # strip leading /cmd or .cmd
         parts = text.split(None, 1)
         prompt = parts[1] if len(parts) > 1 else ""
         await _call_provider(update, context, key, prompt)
     return handler
 
 
-# ---------- API key inspector ----------
+# ============================================================
+# API key inspector
+# ============================================================
 async def cmd_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await force_join_ok(update, context):
-        return
+    if not await force_join_ok(update, context): return
     args = context.args
     if not args:
-        await safe_reply(update, "Usage: /key <API_KEY>\nExample: /key sk-...")
+        _AWAIT_INPUT[update.effective_user.id] = ("key", None)
+        await update.effective_message.reply_text(
+            "Send the API key now as your next message. (OpenAI, Anthropic, "
+            "Gemini, Groq, OpenRouter, Cohere, DeepSeek, xAI, Together AI)",
+        )
         return
-    key = args[0]
+    await _do_inspect(update, args[0])
+
+
+async def _do_inspect(update: Update, key: str):
     placeholder = await update.effective_message.reply_text("Inspecting key...")
     try:
         info = await inspect_key(key)
         if not info.get("valid"):
             await safe_edit(placeholder,
-                f"{info.get('provider', 'Unknown')}  •  INVALID\n"
-                f"Status: {info.get('status')}\n"
-                f"Detail: {json.dumps(info.get('error'))[:600]}")
+                f"*{info.get('provider', 'Unknown')}*  •  INVALID\n"
+                f"Status: `{info.get('status')}`\n"
+                f"Detail: `{json.dumps(info.get('error'))[:500]}`")
             return
         _PENDING_KEY[update.effective_user.id] = key
         models = info.get("models", [])
         limits = info.get("limits", {})
         lines = [
-            f"{info['provider']}  •  ACTIVE",
-            f"Models available ({len(models)}):",
+            f"*{info['provider']}*  •  ACTIVE",
+            f"Models available: *{len(models)}*",
+            "",
         ]
         for m in models[:30]:
-            lines.append(f"  - {m}")
+            lines.append(f"• `{m}`")
         if len(models) > 30:
-            lines.append(f"  ... +{len(models)-30} more")
+            lines.append(f"... +{len(models)-30} more")
         if limits:
-            lines.append("\nLimits / Quota:")
+            lines.append("\n*Limits / Quota:*")
             for k, v in limits.items():
-                lines.append(f"  {k}: {v}")
-        lines.append("\nTry a model:")
-        lines.append("  /tryke <model> <your prompt>")
+                lines.append(f"  • {k}: `{v}`")
+        lines.append("\nTry a model: `/tryke <model> <prompt>`")
         await safe_edit(placeholder, "\n".join(lines))
     except Exception as e:
-        await safe_edit(placeholder, f"Inspection failed: {e}")
+        await safe_edit(placeholder, f"Inspection failed: `{e}`")
 
 
 async def cmd_tryke(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await force_join_ok(update, context):
-        return
+    if not await force_join_ok(update, context): return
     key = _PENDING_KEY.get(update.effective_user.id)
     if not key:
-        await safe_reply(update, "First inspect a key with /key <API_KEY>.")
+        await update.effective_message.reply_text("First inspect a key with /key <API_KEY>.")
         return
     if len(context.args) < 2:
-        await safe_reply(update, "Usage: /tryke <model> <prompt>")
+        await update.effective_message.reply_text("Usage: /tryke <model> <prompt>")
         return
     model = context.args[0]
     prompt = " ".join(context.args[1:])
     placeholder = await update.effective_message.reply_text(f"Calling {model}...")
     try:
-        out = await asyncio.wait_for(try_model(key, model, prompt), timeout=90)
-        await safe_edit(placeholder, f"{model}\n\n{out}")
+        out = await asyncio.wait_for(try_model(key, model, prompt), timeout=120)
+        await safe_edit(placeholder, f"*{model}*\n\n{format_ai_answer(out)}")
     except Exception as e:
-        await safe_edit(placeholder, f"Call failed: {e}")
+        await safe_edit(placeholder, f"Call failed: `{e}`")
 
 
-# ---------- Owner commands (hidden from users) ----------
+# ============================================================
+# Video downloader
+# ============================================================
+async def cmd_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await force_join_ok(update, context): return
+    text = " ".join(context.args).strip()
+    url = downloader.detect_url(text) or text
+    if not url or not url.startswith("http"):
+        _AWAIT_INPUT[update.effective_user.id] = ("download", None)
+        await update.effective_message.reply_text(
+            "Send the video URL now (YouTube, Facebook, Instagram, TikTok)."
+        )
+        return
+    await _run_download(update, context, url)
+
+
+async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
+    chat_id = update.effective_chat.id
+    status = await update.effective_message.reply_text("Queued. Downloading...")
+    info = None
+    try:
+        async with _DOWNLOAD_SEM:
+            await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+            try:
+                await status.edit_text("Downloading video...")
+            except Exception: pass
+            info = await asyncio.wait_for(downloader.download(url), timeout=300)
+            try:
+                await status.edit_text(f"Uploading ({human_size(info['size'])})...")
+            except Exception: pass
+            caption = (
+                f"*{escape_html(info['title']) or 'Video'}*\n"
+                f"_{escape_html(info['uploader'])}_  •  {human_size(info['size'])}"
+            )
+            with open(info["path"], "rb") as f:
+                await context.bot.send_video(
+                    chat_id=chat_id, video=f, caption=caption,
+                    parse_mode=ParseMode.MARKDOWN, supports_streaming=True,
+                    write_timeout=180, read_timeout=180,
+                )
+            try: await status.delete()
+            except Exception: pass
+        await db.log("INFO", update.effective_user.id, "dl", url[:200])
+    except asyncio.TimeoutError:
+        try: await status.edit_text("Download timed out.")
+        except Exception: pass
+    except Exception as e:
+        try: await status.edit_text(f"Download failed:\n{e}")
+        except Exception: pass
+        await db.log("ERROR", update.effective_user.id, "dl", f"{url} | {e}")
+    finally:
+        if info: downloader.cleanup(info)
+
+
+# ============================================================
+# Owner panel
+# ============================================================
 async def _owner_only(update: Update) -> bool:
-    if not is_owner(update.effective_user.id):
-        # silent: pretend command doesn't exist
-        return False
-    return True
+    return is_owner(update.effective_user.id)
 
 
 async def cmd_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _owner_only(update): return
-    lines = [
-        "Owner Commands",
-        "",
-        "/stats        — bot statistics",
-        "/logs [n]     — last n log entries (default 20)",
-        "/users        — total user count",
-        "/setchannel <username>  — set force-join channel",
-        "/ban <user_id>",
-        "/unban <user_id>",
-        "/announce <text>        — broadcast to all users",
-        "/announce_reply         — reply to a message with this to broadcast it",
-        "/owner        — this menu",
-    ]
-    await safe_reply(update, "\n".join(lines))
+    await update.effective_message.reply_text("Owner panel:", reply_markup=owner_kb())
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _owner_only(update): return
     s = await db.stats()
     ch = await db.get_setting("force_join", FORCE_JOIN_CHANNEL or "(none)")
-    await safe_reply(update,
-        f"Bot Status\n"
-        f"  Users:    {s['users']}\n"
-        f"  Banned:   {s['banned']}\n"
-        f"  Messages: {s['messages']}\n"
-        f"  Errors:   {s['errors']}\n"
-        f"  Channel:  {ch}\n"
-        f"  Providers: {', '.join(REGISTRY.keys())}")
+    live = await db.get_setting("live_response", "on")
+    await send_md(update.effective_message,
+        f"*Bot Status*\n"
+        f"• Users: `{s['users']}`\n"
+        f"• Banned: `{s['banned']}`\n"
+        f"• Messages: `{s['messages']}`\n"
+        f"• Errors: `{s['errors']}`\n"
+        f"• Channel: `{ch}`\n"
+        f"• Live response: `{live}`\n"
+        f"• Providers: `{', '.join(REGISTRY.keys())}`")
 
 
 async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -317,61 +469,54 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
     rows = await db.get_logs(n)
     if not rows:
-        await safe_reply(update, "No logs yet.")
-        return
-    lines = ["Recent Logs (newest first)"]
+        await update.effective_message.reply_text("No logs yet."); return
+    lines = ["*Recent Logs* (newest first)"]
     for ts, lvl, uid, prov, msg in rows:
         when = time.strftime("%m-%d %H:%M:%S", time.localtime(ts))
-        lines.append(f"[{when}] {lvl} u={uid} {prov}: {msg[:140]}")
-    await safe_reply(update, "\n".join(lines))
+        lines.append(f"`[{when}]` {lvl} u={uid} {prov}: {msg[:140]}")
+    await send_md(update.effective_message, "\n".join(lines))
 
 
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _owner_only(update): return
     ids = await db.all_user_ids()
-    await safe_reply(update, f"Total active users: {len(ids)}")
+    await update.effective_message.reply_text(f"Total active users: {len(ids)}")
 
 
 async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _owner_only(update): return
-    global FORCE_JOIN_CHANNEL
     if not context.args:
-        await safe_reply(update, "Usage: /setchannel <username_without_@>  (use 'off' to disable)")
+        await update.effective_message.reply_text(
+            "Usage: /setchannel <username_without_@>  (use 'off' to disable)")
         return
     val = context.args[0].lstrip("@")
-    if val.lower() == "off":
-        val = ""
+    if val.lower() == "off": val = ""
     await db.set_setting("force_join", val)
-    # update runtime
     import bot.config as cfg
     cfg.FORCE_JOIN_CHANNEL = val
-    from . import handlers as h
-    h.FORCE_JOIN_CHANNEL = val  # local rebind not needed but explicit
-    await safe_reply(update, f"Force-join channel set to: {val or '(disabled)'}")
+    await update.effective_message.reply_text(f"Force-join channel: {val or '(disabled)'}")
 
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _owner_only(update): return
     if not context.args:
-        await safe_reply(update, "Usage: /ban <user_id>"); return
+        await update.effective_message.reply_text("Usage: /ban <user_id>"); return
     try:
-        uid = int(context.args[0])
-        await db.set_banned(uid, 1)
-        await safe_reply(update, f"User {uid} banned.")
+        uid = int(context.args[0]); await db.set_banned(uid, 1)
+        await update.effective_message.reply_text(f"User {uid} banned.")
     except Exception as e:
-        await safe_reply(update, f"Failed: {e}")
+        await update.effective_message.reply_text(f"Failed: {e}")
 
 
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _owner_only(update): return
     if not context.args:
-        await safe_reply(update, "Usage: /unban <user_id>"); return
+        await update.effective_message.reply_text("Usage: /unban <user_id>"); return
     try:
-        uid = int(context.args[0])
-        await db.set_banned(uid, 0)
-        await safe_reply(update, f"User {uid} unbanned.")
+        uid = int(context.args[0]); await db.set_banned(uid, 0)
+        await update.effective_message.reply_text(f"User {uid} unbanned.")
     except Exception as e:
-        await safe_reply(update, f"Failed: {e}")
+        await update.effective_message.reply_text(f"Failed: {e}")
 
 
 async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -381,7 +526,8 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text and rep:
         text = rep.text or rep.caption or ""
     if not text:
-        await safe_reply(update, "Usage: /announce <text>  or reply to a message with /announce")
+        await update.effective_message.reply_text(
+            "Usage: /announce <text>  or reply to a message with /announce")
         return
     ids = await db.all_user_ids()
     ok = fail = 0
@@ -393,125 +539,381 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             fail += 1
         if i % 25 == 0:
-            await asyncio.sleep(1)  # throttle
-            try:
-                await status.edit_text(f"Progress: {i}/{len(ids)}  ok={ok} fail={fail}")
-            except Exception:
-                pass
-    await status.edit_text(f"Announcement complete.\n  Delivered: {ok}\n  Failed:    {fail}")
+            await asyncio.sleep(1)
+            try: await status.edit_text(f"Progress {i}/{len(ids)}  ok={ok} fail={fail}")
+            except Exception: pass
+    await status.edit_text(f"Done.\nDelivered: {ok}\nFailed: {fail}")
 
 
-# ---------- Callback queries ----------
+async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _owner_only(update): return
+    cur = await db.get_setting("live_response", "on")
+    new = "off" if cur == "on" else "on"
+    if context.args and context.args[0].lower() in ("on", "off"):
+        new = context.args[0].lower()
+    await db.set_setting("live_response", new)
+    await update.effective_message.reply_text(
+        f"Live response is now: {new.upper()}\n"
+        f"(When OFF, the bot won't show 'thinking...' previews — only final answers.)")
+
+
+# ---------- Speak-as-bot ----------
+async def cmd_speak(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner (or granted user): /speak <chat_id> — set target chat to talk in."""
+    uid = update.effective_user.id
+    if not await db.can_speak(uid, OWNER_ID):
+        return
+    if not context.args:
+        cur = await db.get_speak_target(uid)
+        await update.effective_message.reply_text(
+            f"Current speak target: `{cur}`\n"
+            f"Usage: /speak <chat_id_or_@username>  (use 'off' to stop)\n"
+            f"After setting, any message you send to this bot is forwarded as the bot's message.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    target = context.args[0]
+    if target.lower() == "off":
+        await db.set_speak_target(uid, None)
+        await update.effective_message.reply_text("Speak mode OFF.")
+        return
+    # Resolve username -> chat id
+    chat_id = None
+    if target.startswith("@") or not target.lstrip("-").isdigit():
+        try:
+            chat = await context.bot.get_chat(target if target.startswith("@") else f"@{target}")
+            chat_id = chat.id
+        except Exception as e:
+            await update.effective_message.reply_text(f"Cannot resolve {target}: {e}")
+            return
+    else:
+        chat_id = int(target)
+    await db.set_speak_target(uid, chat_id)
+    await update.effective_message.reply_text(
+        f"Speak mode ON. Target: `{chat_id}`\n"
+        f"Now send any text/photo/video — bot will post it there.\n"
+        f"Use /speak off to stop.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _owner_only(update): return
+    if not context.args:
+        rows = await db.list_speak_grants()
+        if not rows:
+            await update.effective_message.reply_text("No granted users.\nUsage: /grant <user_id>")
+            return
+        await update.effective_message.reply_text(
+            "Granted users:\n" + "\n".join(f"• {u}" for u, _ in rows))
+        return
+    try:
+        uid = int(context.args[0])
+        await db.grant_speak(uid)
+        await update.effective_message.reply_text(f"Granted speak-as-bot to {uid}.")
+    except Exception as e:
+        await update.effective_message.reply_text(f"Failed: {e}")
+
+
+async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _owner_only(update): return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /revoke <user_id>"); return
+    try:
+        uid = int(context.args[0])
+        await db.revoke_speak(uid)
+        await update.effective_message.reply_text(f"Revoked from {uid}.")
+    except Exception as e:
+        await update.effective_message.reply_text(f"Failed: {e}")
+
+
+# ============================================================
+# Callback handler
+# ============================================================
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data or ""
+    uid = update.effective_user.id
+
     if data == "verify_join":
         if await force_join_ok(update, context):
-            try:
-                await q.edit_message_text("Verified. You can now use the bot. Send /start.")
-            except Exception:
-                pass
+            try: await q.edit_message_text("Verified. Tap /start.")
+            except Exception: pass
         return
+
+    if data == "m:home":
+        await q.edit_message_text("Main menu:", reply_markup=main_menu_kb(uid)); return
+    if data == "m:providers":
+        await q.edit_message_text("Choose an AI provider:", reply_markup=providers_kb()); return
+    if data == "m:keytools":
+        await q.edit_message_text("API key tools:", reply_markup=keytools_kb()); return
+    if data == "m:dl":
+        await q.edit_message_text(
+            "*Video Downloader*\n\nSupports YouTube, Facebook, Instagram, TikTok.\n"
+            "Max 50MB. Send the URL after tapping below.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=dl_kb()); return
+    if data == "m:help":
+        await q.edit_message_text(
+            "*Help*\n\nUse the buttons in the main menu, or these commands:\n"
+            "/key, /tryke, /dl, /menu, /ping, /help <topic>",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=back_home_kb()); return
+    if data == "m:owner":
+        if not is_owner(uid): return
+        await q.edit_message_text("Owner panel:", reply_markup=owner_kb()); return
+
     if data.startswith("pick:"):
         k = data.split(":", 1)[1]
         name = REGISTRY.get(k, (k,))[0]
         await q.edit_message_text(
-            f"Selected: {name}\nSend: .{k} your question\n"
-            f"Or:    /{k} your question"
-        )
+            f"*Selected: {name}*\n\n"
+            f"Send: `.{k} your question`\nOr: `/{k} your question`\n\n"
+            f"Reply to my answer to continue the conversation.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=back_home_kb())
         return
-    if data == "info:keycheck":
+
+    if data == "kt:inspect":
+        _AWAIT_INPUT[uid] = ("key", None)
         await q.edit_message_text(
-            "API Key Inspector\n\nSend: /key <API_KEY>\n\n"
-            "Supports: OpenAI, Anthropic, Google Gemini, Groq, OpenRouter, "
-            "Cohere, DeepSeek, xAI, Together AI, and any OpenAI-compatible key."
-        )
+            "Send the API key as your next message.",
+            reply_markup=back_home_kb()); return
+    if data == "kt:try":
+        if uid not in _PENDING_KEY:
+            await q.edit_message_text("No key inspected yet. Inspect one first.",
+                                       reply_markup=back_home_kb()); return
+        _AWAIT_INPUT[uid] = ("tryke", None)
+        await q.edit_message_text(
+            "Send: `<model> <your prompt>`",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=back_home_kb()); return
+
+    if data == "dl:ask":
+        _AWAIT_INPUT[uid] = ("download", None)
+        await q.edit_message_text("Send the video URL now.", reply_markup=back_home_kb()); return
+
+    # Owner sub-actions
+    if data.startswith("ow:"):
+        if not is_owner(uid): return
+        sub = data[3:]
+        if sub == "stats":
+            s = await db.stats()
+            ch = await db.get_setting("force_join", FORCE_JOIN_CHANNEL or "(none)")
+            live = await db.get_setting("live_response", "on")
+            await q.edit_message_text(
+                f"*Stats*\nUsers: `{s['users']}` | Banned: `{s['banned']}`\n"
+                f"Messages: `{s['messages']}` | Errors: `{s['errors']}`\n"
+                f"Channel: `{ch}` | Live: `{live}`",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=owner_kb())
+            return
+        if sub == "logs":
+            rows = await db.get_logs(15)
+            lines = ["*Recent Logs*"]
+            for ts, lvl, u, prov, msg in rows:
+                when = time.strftime("%m-%d %H:%M", time.localtime(ts))
+                lines.append(f"`[{when}]` {lvl} u={u} {prov}: {msg[:80]}")
+            await q.edit_message_text("\n".join(lines) or "No logs.",
+                                       parse_mode=ParseMode.MARKDOWN, reply_markup=owner_kb())
+            return
+        if sub == "users":
+            ids = await db.all_user_ids()
+            await q.edit_message_text(f"Active users: {len(ids)}", reply_markup=owner_kb()); return
+        if sub == "announce":
+            _AWAIT_INPUT[uid] = ("announce", None)
+            await q.edit_message_text("Send the announcement text now.", reply_markup=owner_kb()); return
+        if sub == "speak":
+            _AWAIT_INPUT[uid] = ("speak_to", None)
+            await q.edit_message_text(
+                "Send target chat ID or @username (or 'off').", reply_markup=owner_kb()); return
+        if sub == "grants":
+            rows = await db.list_speak_grants()
+            txt = "*Speak Grants*\n"
+            txt += "\n".join(f"• {u}" for u, _ in rows) if rows else "(none)"
+            txt += "\n\nUse /grant <id> or /revoke <id>"
+            await q.edit_message_text(txt, parse_mode=ParseMode.MARKDOWN, reply_markup=owner_kb()); return
+        if sub == "live":
+            cur = await db.get_setting("live_response", "on")
+            new = "off" if cur == "on" else "on"
+            await db.set_setting("live_response", new)
+            await q.edit_message_text(f"Live response: {new.upper()}", reply_markup=owner_kb()); return
+        if sub == "setch":
+            _AWAIT_INPUT[uid] = ("setchannel", None)
+            await q.edit_message_text(
+                "Send channel username (without @), or 'off' to disable.",
+                reply_markup=owner_kb()); return
 
 
-# ---------- Dot-prefix dispatcher ----------
+# ============================================================
+# Text dispatcher
+# ============================================================
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle messages starting with '.' as commands, and reply-to-bot continuations."""
     msg = update.effective_message
-    text = (msg.text or "").strip()
+    text = (msg.text or msg.caption or "").strip()
     if not text:
         return
     await db.upsert_user(update.effective_user)
     if await db.is_banned(update.effective_user.id):
         return
+    uid = update.effective_user.id
 
-    # 1) Reply-to-bot continuation (no command prefix) -> use that session's provider
+    # 1) Awaiting structured input
+    awaiting = _AWAIT_INPUT.pop(uid, None)
+    if awaiting:
+        kind, _ = awaiting
+        if kind == "key":
+            await _do_inspect(update, text.split()[0]); return
+        if kind == "tryke":
+            parts = text.split(None, 1)
+            if len(parts) < 2:
+                await msg.reply_text("Format: <model> <prompt>"); return
+            context.args = [parts[0]] + parts[1].split()
+            # build context.args style
+            context.args = [parts[0]] + [parts[1]]
+            await cmd_tryke(update, context); return
+        if kind == "download":
+            url = downloader.detect_url(text) or text
+            await _run_download(update, context, url); return
+        if kind == "announce":
+            context.args = text.split()
+            await cmd_announce(update, context); return
+        if kind == "speak_to":
+            context.args = [text.split()[0]]
+            await cmd_speak(update, context); return
+        if kind == "setchannel":
+            context.args = [text.split()[0]]
+            await cmd_setchannel(update, context); return
+
+    # 2) Owner/granted speak-as-bot forward
+    target = await db.get_speak_target(uid)
+    if target and await db.can_speak(uid, OWNER_ID) and not text.startswith(("/", ".")):
+        try:
+            await context.bot.send_message(target, text)
+            await msg.reply_text(f"→ sent to {target}")
+        except Exception as e:
+            await msg.reply_text(f"Send failed: {e}")
+        return
+
+    # 3) Auto-detect video URLs and offer download
+    url = downloader.detect_url(text)
+    if url and not text.startswith(("/", ".")):
+        await _run_download(update, context, url); return
+
+    # 4) Reply-to-bot continuation
     if msg.reply_to_message and msg.reply_to_message.from_user \
             and msg.reply_to_message.from_user.id == context.bot.id \
             and not text.startswith(("/", ".")):
         sess = await db.get_session(msg.chat_id, msg.reply_to_message.message_id)
         if sess:
-            provider_key = sess[0]
-            await _call_provider(update, context, provider_key, text)
-            return
+            await _call_provider(update, context, sess[0], text); return
 
-    # 2) Dot-prefix commands: .g .pr .co .key .help .menu .ping .start ...
+    # 5) Dot-prefix commands
     if text.startswith("."):
         first, _, rest = text[1:].partition(" ")
         cmd = first.lower()
         if cmd in REGISTRY:
-            await _call_provider(update, context, cmd, rest)
-            return
-        # alias dot-commands to slash equivalents
+            await _call_provider(update, context, cmd, rest); return
         alias = {
             "start": cmd_start, "help": cmd_help, "menu": cmd_menu,
-            "ping": cmd_ping, "key": cmd_key, "tryke": cmd_tryke,
+            "ping": cmd_ping, "key": cmd_key, "tryke": cmd_tryke, "dl": cmd_dl,
         }
         if cmd in alias:
-            # rebuild context.args for compatibility
             context.args = rest.split() if rest else []
-            await alias[cmd](update, context)
-            return
-        # owner dot-commands
-        if is_owner(update.effective_user.id):
-            owner_alias = {
+            await alias[cmd](update, context); return
+        if is_owner(uid):
+            oalias = {
                 "owner": cmd_owner, "stats": cmd_stats, "logs": cmd_logs,
                 "users": cmd_users, "setchannel": cmd_setchannel,
                 "ban": cmd_ban, "unban": cmd_unban, "announce": cmd_announce,
+                "live": cmd_live, "speak": cmd_speak, "grant": cmd_grant, "revoke": cmd_revoke,
             }
-            if cmd in owner_alias:
+            if cmd in oalias:
                 context.args = rest.split() if rest else []
-                await owner_alias[cmd](update, context)
-                return
+                await oalias[cmd](update, context); return
 
 
-# ---------- Error handler ----------
+# ============================================================
+# Error handler
+# ============================================================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))[:1800]
+    try: await db.log("ERROR", 0, "system", tb)
+    except Exception: pass
+
+
+# ============================================================
+# BotCommand menus (per-scope)
+# ============================================================
+USER_COMMANDS = [
+    BotCommand("start", "Main menu"),
+    BotCommand("menu",  "Open buttons menu"),
+    BotCommand("key",   "Inspect an API key"),
+    BotCommand("tryke", "Try a model with last key"),
+    BotCommand("dl",    "Download YT/FB/IG/TikTok video"),
+    BotCommand("ping",  "Latency check"),
+    BotCommand("help",  "Help (add a topic for AI summary)"),
+]
+
+OWNER_EXTRA = [
+    BotCommand("owner",      "Owner panel"),
+    BotCommand("stats",      "Bot statistics"),
+    BotCommand("logs",       "Recent logs"),
+    BotCommand("users",      "Active user count"),
+    BotCommand("announce",   "Broadcast to all users"),
+    BotCommand("setchannel", "Set force-join channel"),
+    BotCommand("ban",        "Ban a user id"),
+    BotCommand("unban",      "Unban a user id"),
+    BotCommand("live",       "Toggle live response"),
+    BotCommand("speak",      "Speak as bot in a chat"),
+    BotCommand("grant",      "Grant speak access"),
+    BotCommand("revoke",     "Revoke speak access"),
+]
+
+
+async def setup_bot_commands(app: Application):
     try:
-        await db.log("ERROR", 0, "system", tb)
+        await app.bot.set_my_commands(USER_COMMANDS, scope=BotCommandScopeDefault())
+        if OWNER_ID:
+            await app.bot.set_my_commands(
+                USER_COMMANDS + OWNER_EXTRA, scope=BotCommandScopeChat(OWNER_ID),
+            )
+        # Also give granted speak users the /speak command
+        for u, _ in await db.list_speak_grants():
+            try:
+                await app.bot.set_my_commands(
+                    USER_COMMANDS + [BotCommand("speak", "Speak as bot")],
+                    scope=BotCommandScopeChat(u),
+                )
+            except Exception:
+                pass
     except Exception:
         pass
 
 
 def register_handlers(app: Application):
-    # User commands
+    # User
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("key", cmd_key))
+    app.add_handler(CommandHandler("help",  cmd_help))
+    app.add_handler(CommandHandler("menu",  cmd_menu))
+    app.add_handler(CommandHandler("ping",  cmd_ping))
+    app.add_handler(CommandHandler("key",   cmd_key))
     app.add_handler(CommandHandler("tryke", cmd_tryke))
+    app.add_handler(CommandHandler("dl",    cmd_dl))
 
-    # Provider slash commands (dynamic)
     for k in list(REGISTRY.keys()):
         app.add_handler(CommandHandler(k, make_provider_handler(k)))
 
-    # Owner commands
-    app.add_handler(CommandHandler("owner", cmd_owner))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("logs", cmd_logs))
-    app.add_handler(CommandHandler("users", cmd_users))
+    # Owner
+    app.add_handler(CommandHandler("owner",      cmd_owner))
+    app.add_handler(CommandHandler("stats",      cmd_stats))
+    app.add_handler(CommandHandler("logs",       cmd_logs))
+    app.add_handler(CommandHandler("users",      cmd_users))
     app.add_handler(CommandHandler("setchannel", cmd_setchannel))
-    app.add_handler(CommandHandler("ban", cmd_ban))
-    app.add_handler(CommandHandler("unban", cmd_unban))
-    app.add_handler(CommandHandler("announce", cmd_announce))
+    app.add_handler(CommandHandler("ban",        cmd_ban))
+    app.add_handler(CommandHandler("unban",      cmd_unban))
+    app.add_handler(CommandHandler("announce",   cmd_announce))
+    app.add_handler(CommandHandler("live",       cmd_live))
+    app.add_handler(CommandHandler("speak",      cmd_speak))
+    app.add_handler(CommandHandler("grant",      cmd_grant))
+    app.add_handler(CommandHandler("revoke",     cmd_revoke))
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
