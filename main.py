@@ -39,7 +39,12 @@ async def _amain():
         .concurrent_updates(True)   # multi-user concurrency
         .build()
     )
+    # Load any owner-added custom providers BEFORE register_handlers so they
+    # are bound as /commands too.
+    await load_custom_providers(None)
     register_handlers(app)
+    # Re-bind handlers for custom providers onto the running app
+    await load_custom_providers(app)
 
     # Health server (non-blocking, daemon thread)
     me = await app.bot.get_me()
@@ -55,7 +60,9 @@ async def _amain():
     await app.start()
     await app.updater.start_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "callback_query", "edited_message"],
+        allowed_updates=[
+            "message", "callback_query", "edited_message", "inline_query",
+        ],
     )
     log.info("Polling started. Press Ctrl+C to stop.")
 
