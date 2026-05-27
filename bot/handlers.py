@@ -8,7 +8,6 @@ from collections import defaultdict
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
-    FSInputFile,
 )
 from telegram.constants import ChatAction, ChatMemberStatus, ParseMode
 from telegram.ext import (
