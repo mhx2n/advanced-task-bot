@@ -34,7 +34,7 @@ def detect_url(text: str) -> Optional[str]:
     return None
 
 
-def _ydl_opts(outtmpl: str) -> dict:
+def _ydl_opts(outtmpl: str, relaxed: bool = False) -> dict:
     opts: dict = {
         "outtmpl": outtmpl,
         "noplaylist": True,
@@ -42,10 +42,13 @@ def _ydl_opts(outtmpl: str) -> dict:
         "no_warnings": True,
         # Prefer compact mp4 under cap. Falls back gracefully.
         "format": (
+            "bv*[ext=mp4]+ba[ext=m4a]/"
+            "bv*+ba/"
             f"best[filesize<{MAX_BYTES}][ext=mp4]/"
             f"best[filesize<{MAX_BYTES}]/"
             "best[height<=720][ext=mp4]/best[height<=720]/best"
-        ),
+        ) if not relaxed else "bv*+ba/b",
+        "format_sort": ["+size", "+br", "+res", "+fps"],
         "merge_output_format": "mp4",
         "concurrent_fragment_downloads": 4,
         "retries": 3,
@@ -83,18 +86,31 @@ def _ydl_opts(outtmpl: str) -> dict:
 
 def _sync_download(url: str, workdir: str) -> dict:
     outtmpl = os.path.join(workdir, "%(id).40s.%(ext)s")
-    with yt_dlp.YoutubeDL(_ydl_opts(outtmpl)) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if "entries" in info:  # playlist — take first
-            info = info["entries"][0]
-        path = ydl.prepare_filename(info)
-        # yt-dlp may have remuxed -> swap extension if needed
-        if not os.path.exists(path):
-            base, _ = os.path.splitext(path)
-            for ext in (".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3"):
-                if os.path.exists(base + ext):
-                    path = base + ext
+    last_err = None
+    info = None
+    path = ""
+    for relaxed in (False, True):
+        try:
+            with yt_dlp.YoutubeDL(_ydl_opts(outtmpl, relaxed=relaxed)) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if "entries" in info:  # playlist — take first
+                    info = info["entries"][0]
+                path = ydl.prepare_filename(info)
+                if not os.path.exists(path):
+                    base, _ = os.path.splitext(path)
+                    for ext in (".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3"):
+                        if os.path.exists(base + ext):
+                            path = base + ext
+                            break
+                if os.path.exists(path):
                     break
+        except Exception as e:
+            last_err = e
+            if not relaxed and "requested format is not available" in str(e).lower():
+                continue
+            raise
+    if not info:
+        raise last_err or RuntimeError("Download failed")
     size = os.path.getsize(path) if os.path.exists(path) else 0
     return {
         "path": path,
