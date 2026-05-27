@@ -1098,6 +1098,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(
                 "Send channel username (without @), or 'off' to disable.",
                 reply_markup=owner_kb()); return
+        if sub == "noop":
+            return
+        if sub.startswith("toggle:"):
+            try: page = int(sub.split(":", 1)[1])
+            except Exception: page = 0
+            await q.edit_message_text(
+                "<b>Toggle Commands</b>\n\nTap a command to turn it ON/OFF. "
+                "Disabled commands are hidden from the menu and blocked from use.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=await toggle_kb(page),
+            )
+            return
+
+    # Toggle a single command on/off
+    if data.startswith("tg:"):
+        if not is_owner(uid): return
+        parts = data.split(":")
+        cmd = parts[1]; page = int(parts[2]) if len(parts) > 2 else 0
+        disabled = await _disabled_set()
+        if cmd in disabled: disabled.discard(cmd)
+        else: disabled.add(cmd)
+        await _set_disabled(disabled)
+        try:
+            await setup_bot_commands(context.application)
+        except Exception:
+            pass
+        await q.edit_message_text(
+            "<b>Toggle Commands</b>\n\nTap a command to turn it ON/OFF.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=await toggle_kb(page),
+        )
+        return
 
 
 # ============================================================
