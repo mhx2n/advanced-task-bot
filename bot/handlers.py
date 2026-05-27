@@ -1044,5 +1044,6 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("restart",    cmd_restart))
 
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(InlineQueryHandler(on_inline_query))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
