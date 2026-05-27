@@ -425,14 +425,13 @@ async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
             try:
                 await status.edit_text(f"Uploading ({human_size(info['size'])})...")
             except Exception: pass
-            caption = (
-                f"*{escape_html(info['title']) or 'Video'}*\n"
-                f"_{escape_html(info['uploader'])}_  •  {human_size(info['size'])}"
-            )
+            caption = clean_text(
+                f"{info['title'] or 'Video'}\n{info['uploader']} • {human_size(info['size'])}"
+            )[:900]
             with open(info["path"], "rb") as f:
                 await context.bot.send_video(
                     chat_id=chat_id, video=f, caption=caption,
-                    parse_mode=ParseMode.MARKDOWN, supports_streaming=True,
+                    supports_streaming=True,
                     write_timeout=180, read_timeout=180,
                 )
             try: await status.delete()
@@ -570,7 +569,61 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.set_setting("live_response", new)
     await update.effective_message.reply_text(
         f"Live response is now: {new.upper()}\n"
-        f"(When OFF, the bot won't show 'thinking...' previews — only final answers.)")
+        f"(When ON, the answer text appears progressively like live typing.)")
+
+
+async def cmd_addprovider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _owner_only(update): return
+    if len(context.args) < 5:
+        await update.effective_message.reply_text(
+            "Usage: /addprovider <cmd> <name> <base_url> <api_key> <model>"
+        )
+        return
+    from .providers import register, make_openai_compatible_provider
+    cmd = context.args[0].lower().strip()
+    name, base_url, api_key = context.args[1], context.args[2], context.args[3]
+    model = " ".join(context.args[4:]).strip()
+    func = make_openai_compatible_provider(name, base_url, api_key, model)
+    register(cmd, name, func)
+    await db.add_custom_provider(cmd, name, base_url, api_key, model)
+    await setup_bot_commands(context.application)
+    await update.effective_message.reply_text(f"Provider added: /{cmd} and .{cmd}")
+
+
+async def cmd_delprovider(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _owner_only(update): return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /delprovider <cmd>")
+        return
+    cmd = context.args[0].lower().strip()
+    REGISTRY.pop(cmd, None)
+    await db.remove_custom_provider(cmd)
+    await setup_bot_commands(context.application)
+    await update.effective_message.reply_text(f"Provider removed: {cmd}")
+
+
+async def cmd_providers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["<b>Available providers</b>", ""]
+    for key, (name, _) in REGISTRY.items():
+        lines.append(f"• <b>{escape_html(name)}</b> — <code>/{key}</code> or <code>.{key}</code>")
+    await send_md(update.effective_message, "\n".join(lines))
+
+
+async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = (update.inline_query.query or "").strip()
+    if not query:
+        return
+    results = []
+    for key, (name, _) in list(REGISTRY.items())[:12]:
+        results.append(
+            InlineQueryResultArticle(
+                id=str(uuid4()),
+                title=f"Ask {name}",
+                description=f"Send to bot as .{key} {query[:40]}",
+                input_message_content=InputTextMessageContent(f".{key} {query}"),
+            )
+        )
+    await update.inline_query.answer(results, cache_time=0, is_personal=True)
 
 
 # ---------- Speak-as-bot ----------
