@@ -44,6 +44,9 @@ async def _amain():
     await load_custom_providers(None)
     register_handlers(app)
 
+    await app.initialize()
+    await app.start()
+
     # Health server (non-blocking, daemon thread)
     me = await app.bot.get_me()
     run_in_thread(PORT, {"username": me.username, "id": me.id})
@@ -54,8 +57,6 @@ async def _amain():
     await notify_restart_complete(app)
 
     # Drop pending updates from previous run to avoid double-processing.
-    await app.initialize()
-    await app.start()
     await app.updater.start_polling(
         drop_pending_updates=True,
         allowed_updates=[
