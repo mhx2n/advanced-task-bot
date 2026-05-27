@@ -22,7 +22,7 @@ from .config import OWNER_ID, FORCE_JOIN_CHANNEL
 from .providers import REGISTRY, register as register_provider, make_openai_compatible_provider
 from .utils import clean_text, format_ai_answer, chunk_text, escape_html, human_size
 from .keycheck import inspect_key, try_model
-from .tools import textenc as _textenc, language as _language, photo as _photo
+from .tools import textenc as _textenc, language as _language, photo as _photo, shorten as _shorten
 
 
 _HISTORY: dict = defaultdict(list)
