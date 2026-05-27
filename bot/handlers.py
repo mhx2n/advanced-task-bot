@@ -22,7 +22,7 @@ from .config import OWNER_ID, FORCE_JOIN_CHANNEL
 from .providers import REGISTRY, register as register_provider, make_openai_compatible_provider
 from .utils import clean_text, format_ai_answer, chunk_text, escape_html, human_size
 from .keycheck import inspect_key, try_model
-from .tools import textenc as _textenc, language as _language, photo as _photo, shorten as _shorten, stylish as _stylish
+from .tools import textenc as _textenc, language as _language, photo as _photo, shorten as _shorten, stylish as _stylish, translate as _translate
 
 
 _HISTORY: dict = defaultdict(list)
@@ -948,6 +948,7 @@ USER_COMMANDS = [
     BotCommand("res",   "Resize image (presets)"),
     BotCommand("short", "Shorten a URL"),
     BotCommand("style", "Stylish text (40+ fonts)"),
+    BotCommand("tr",    "Translate text (Mistral)"),
     BotCommand("ping",  "Latency check"),
     BotCommand("help",  "Help (add a topic for AI summary)"),
 ]
@@ -966,6 +967,8 @@ OWNER_EXTRA = [
     BotCommand("grant",      "Grant speak access"),
     BotCommand("revoke",     "Revoke speak access"),
     BotCommand("restart",    "Restart the bot process"),
+    BotCommand("mkey",       "Set Mistral API key"),
+    BotCommand("mlimit",     "Set Mistral daily per-user limit"),
 ]
 
 
@@ -1070,6 +1073,7 @@ def register_handlers(app: Application):
     _photo.register(app)
     _shorten.register(app)
     _stylish.register(app)
+    _translate.register(app)
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(InlineQueryHandler(on_inline_query))
