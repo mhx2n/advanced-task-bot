@@ -119,18 +119,101 @@ async def stream_edit(message, text: str, reply_markup=None):
 
 
 # ============================================================
+# Tool catalog (Util-Hub style categorized menu)
+# ============================================================
+TOOL_CATALOG: dict = {
+    "AI Tools": [
+        ("g",     "Gemini",       "Chat with Google Gemini.\n\n<b>Usage:</b>\n<code>/g your question</code>  or  <code>.g your question</code>\nReply to my answer to continue."),
+        ("pr",    "Perplexity",   "Chat with Perplexity AI.\n\n<b>Usage:</b>\n<code>/pr your question</code>  or  <code>.pr ...</code>"),
+        ("co",    "Copilot",      "Chat with Microsoft Copilot.\n\n<b>Usage:</b>\n<code>/co your question</code>  or  <code>.co ...</code>"),
+        ("key",   "API Key Inspector", "Inspect any AI API key (OpenAI, Anthropic, Gemini, Groq, OpenRouter, Cohere, DeepSeek, xAI, Together AI).\n\n<b>Usage:</b>\n<code>/key &lt;API_KEY&gt;</code>"),
+        ("tryke", "Try a Model",  "Call any model on the last inspected key.\n\n<b>Usage:</b>\n<code>/tryke &lt;model&gt; &lt;prompt&gt;</code>"),
+    ],
+    "Text Tools": [
+        ("en",    "Encode",       "Encode to Base64 / Hex / Binary / URL / ROT13.\n\n<b>Usage:</b>\n<code>/en base64 Hello World</code>"),
+        ("de",    "Decode",       "Decode from any common format.\n\n<b>Usage:</b>\n<code>/de base64 SGVsbG8=</code>"),
+        ("text",  "Text Transform","Change case, reverse, etc.\n\n<b>Usage:</b>\n<code>/text upper hello</code>"),
+        ("wc",    "Word & Char Count","Count words, characters, lines.\n\n<b>Usage:</b>\n<code>/wc some text</code> or reply to a message."),
+        ("style", "Stylish Text", "Transform text into 49+ Unicode fonts. Button labels preview the style — tap one and the result appears in the same message, ready to copy.\n\n<b>Usage:</b>\n<code>/style Your Text Here</code>"),
+    ],
+    "Language Tools": [
+        ("spell", "Spell Check",  "Spelling suggestions.\n\n<b>Usage:</b>\n<code>/spell teh quik fox</code>"),
+        ("gra",   "Grammar Fix",  "AI-powered grammar correction.\n\n<b>Usage:</b>\n<code>/gra he go home yesterday</code>"),
+        ("syn",   "Synonyms",     "Word alternatives.\n\n<b>Usage:</b>\n<code>/syn happy</code>"),
+        ("prn",   "Pronounce",    "Phonetic + audio pronunciation.\n\n<b>Usage:</b>\n<code>/prn pronunciation</code>"),
+        ("tr",    "Translate",    "Translate via Mistral AI.\n\n<b>Usage:</b>\n<code>/tr Hello</code> (auto)\n<code>/tr bn Hello</code>\nReply to a message with <code>/tr fr</code>."),
+        ("ocr",   "OCR",          "Extract text from an image.\n\n<b>Usage:</b> Reply to a photo with <code>/ocr</code>.\nReply with <code>/ocr en</code> to translate."),
+    ],
+    "Photo Tools": [
+        ("bg",    "Remove BG",    "Remove image background.\n\n<b>Usage:</b> Reply to a photo with <code>/bg</code>"),
+        ("enh",   "Enhance",      "Sharpen + colour-boost a photo.\n\n<b>Usage:</b> Reply to a photo with <code>/enh</code>"),
+        ("res",   "Resize",       "Resize to popular presets (YouTube, Instagram, Twitter, HD, 4K).\n\n<b>Usage:</b> Reply to a photo with <code>/res</code>, then pick a preset."),
+    ],
+    "Utilities": [
+        ("dl",    "Video Downloader","Download from YouTube, Facebook, Instagram, TikTok, 1000+ sites (max 50MB).\n\n<b>Usage:</b> <code>/dl &lt;url&gt;</code> or just send the URL."),
+        ("short", "URL Shortener","Shorten any URL.\n\n<b>Usage:</b>\n<code>/short https://example.com/path</code>"),
+        ("ping",  "Ping",         "Bot latency check.\n\n<b>Usage:</b> <code>/ping</code>"),
+        ("help",  "Help / About", "AI-summarised help.\n\n<b>Usage:</b>\n<code>/help</code> or <code>/help &lt;topic&gt;</code>"),
+    ],
+}
+
+
+async def _disabled_set() -> set:
+    raw = await db.get_setting("disabled_cmds", "")
+    return {c.strip() for c in raw.split(",") if c.strip()}
+
+
+async def _set_disabled(s: set):
+    await db.set_setting("disabled_cmds", ",".join(sorted(s)))
+
+
+# ============================================================
 # Main menus (inline keyboards)
 # ============================================================
-def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("AI Providers", callback_data="m:providers"),
-         InlineKeyboardButton("API Key Tools", callback_data="m:keytools")],
-        [InlineKeyboardButton("Video Downloader", callback_data="m:dl"),
-         InlineKeyboardButton("Help / About", callback_data="m:help")],
-    ]
+async def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
+    disabled = await _disabled_set()
+    rows, row = [], []
+    for cat, items in TOOL_CATALOG.items():
+        if not any(c not in disabled for c, _, _ in items):
+            continue
+        row.append(InlineKeyboardButton(cat, callback_data=f"cat:{cat}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row: rows.append(row)
     if is_owner(uid):
-        rows.append([InlineKeyboardButton("Owner Panel", callback_data="m:owner")])
+        rows.append([InlineKeyboardButton("⚙️ Owner Panel", callback_data="m:owner")])
     return InlineKeyboardMarkup(rows)
+
+
+async def category_kb(cat: str) -> InlineKeyboardMarkup:
+    disabled = await _disabled_set()
+    rows, row = [], []
+    for cmd, label, _doc in TOOL_CATALOG.get(cat, []):
+        if cmd in disabled:
+            continue
+        row.append(InlineKeyboardButton(label, callback_data=f"tool:{cmd}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("« Back to Main Menu", callback_data="m:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tool_detail_kb(cat_for_back):
+    rows = []
+    if cat_for_back:
+        rows.append([InlineKeyboardButton(f"« Back to {cat_for_back}",
+                                          callback_data=f"cat:{cat_for_back}")])
+    rows.append([InlineKeyboardButton("« Main Menu", callback_data="m:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _find_tool(cmd: str):
+    for cat, items in TOOL_CATALOG.items():
+        for t in items:
+            if t[0] == cmd:
+                return cat, t
+    return None, None
 
 
 def providers_kb() -> InlineKeyboardMarkup:
@@ -168,9 +251,35 @@ def owner_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Speak as Bot", callback_data="ow:speak"),
          InlineKeyboardButton("Speak Grants", callback_data="ow:grants")],
         [InlineKeyboardButton("Live Response Toggle", callback_data="ow:live")],
+        [InlineKeyboardButton("Toggle Commands", callback_data="ow:toggle:0")],
         [InlineKeyboardButton("Set Channel", callback_data="ow:setch")],
         [InlineKeyboardButton("« Back", callback_data="m:home")],
     ])
+
+
+async def toggle_kb(page: int = 0) -> InlineKeyboardMarkup:
+    disabled = await _disabled_set()
+    all_cmds = []
+    for items in TOOL_CATALOG.values():
+        for cmd, label, _doc in items:
+            all_cmds.append((cmd, label))
+    per_page = 8
+    pages = max(1, (len(all_cmds) + per_page - 1) // per_page)
+    page = page % pages
+    chunk = all_cmds[page * per_page:(page + 1) * per_page]
+    rows = []
+    for cmd, label in chunk:
+        mark = "🔴 OFF" if cmd in disabled else "🟢 ON"
+        rows.append([InlineKeyboardButton(
+            f"{mark}  /{cmd} — {label}", callback_data=f"tg:{cmd}:{page}")])
+    if pages > 1:
+        rows.append([
+            InlineKeyboardButton("« Prev", callback_data=f"ow:toggle:{(page-1) % pages}"),
+            InlineKeyboardButton(f"{page+1}/{pages}", callback_data="ow:noop"),
+            InlineKeyboardButton("Next »", callback_data=f"ow:toggle:{(page+1) % pages}"),
+        ])
+    rows.append([InlineKeyboardButton("« Owner Panel", callback_data="m:owner")])
+    return InlineKeyboardMarkup(rows)
 
 
 def back_home_kb() -> InlineKeyboardMarkup:
@@ -442,7 +551,7 @@ async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
         try: await status.edit_text("Download timed out.")
         except Exception: pass
     except Exception as e:
-        try: await status.edit_text(f"Download failed:\n{e}")
+        try: await status.edit_text(f"Download failed:\n{downloader.user_error_text(e)}")
         except Exception: pass
         await db.log("ERROR", update.effective_user.id, "dl", f"{url} | {e}")
     finally:

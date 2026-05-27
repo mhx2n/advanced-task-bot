@@ -181,13 +181,25 @@ def _resize(img_bytes: bytes, w: int, h: int) -> bytes:
     return out.getvalue()
 
 
-def _res_kb() -> InlineKeyboardMarkup:
-    rows, row = [], []
-    for label, key, w, h in RESIZE_PRESETS:
-        row.append(InlineKeyboardButton(f"{label} ({w}×{h})", callback_data=f"res:{key}"))
-        if len(row) == 1:
-            rows.append(row); row = []
-    if row: rows.append(row)
+_RES_PER_PAGE = 6
+
+
+def _res_kb(page: int = 0) -> InlineKeyboardMarkup:
+    total = len(RESIZE_PRESETS)
+    pages = (total + _RES_PER_PAGE - 1) // _RES_PER_PAGE
+    page = page % pages
+    start = page * _RES_PER_PAGE
+    chunk = RESIZE_PRESETS[start:start + _RES_PER_PAGE]
+    rows = []
+    for label, key, w, h in chunk:
+        rows.append([InlineKeyboardButton(
+            f"{label} ({w}×{h})", callback_data=f"res:s:{key}")])
+    if pages > 1:
+        rows.append([
+            InlineKeyboardButton("« Prev", callback_data=f"res:p:{(page-1) % pages}"),
+            InlineKeyboardButton(f"{page+1}/{pages}", callback_data="res:noop"),
+            InlineKeyboardButton("Next »", callback_data=f"res:p:{(page+1) % pages}"),
+        ])
     rows.append([InlineKeyboardButton("Close", callback_data="res:close")])
     return InlineKeyboardMarkup(rows)
 
@@ -201,19 +213,29 @@ async def cmd_res(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _RES_CACHE[update.effective_user.id] = img
     await msg.reply_text(
         _frame("Resize Image", "Choose a target size:"),
-        parse_mode=ParseMode.HTML, reply_markup=_res_kb())
+        parse_mode=ParseMode.HTML, reply_markup=_res_kb(0))
 
 
 async def on_res_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try: await q.answer()
     except Exception: pass
-    key = (q.data or "").split(":", 1)[1] if ":" in (q.data or "") else ""
+    data = q.data or ""
     uid = q.from_user.id
-    if key == "close":
+    if data == "res:noop":
+        return
+    if data == "res:close":
         try: await q.message.delete()
         except Exception: pass
         _RES_CACHE.pop(uid, None); return
+    if data.startswith("res:p:"):
+        try: page = int(data.split(":")[2])
+        except Exception: page = 0
+        try: await q.edit_message_reply_markup(reply_markup=_res_kb(page))
+        except Exception: pass
+        return
+    # res:s:<key>  (legacy res:<key> still tolerated)
+    key = data.split(":")[-1]
     preset = next(((w, h, lbl) for lbl, k, w, h in RESIZE_PRESETS if k == key), None)
     if not preset:
         return

@@ -35,7 +35,7 @@ def detect_url(text: str) -> Optional[str]:
 
 
 def _ydl_opts(outtmpl: str) -> dict:
-    return {
+    opts: dict = {
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
@@ -52,10 +52,28 @@ def _ydl_opts(outtmpl: str) -> dict:
         "socket_timeout": 30,
         "nocheckcertificate": True,
         "geo_bypass": True,
+        # 2024+: YouTube blocks the default "android" client from server IPs.
+        # tv_embedded + ios + mweb still serve streams without PO-token in most regions.
         "extractor_args": {
-            "youtube": {"player_client": ["android", "ios", "web"], "player_skip": ["webpage"]},
+            "youtube": {
+                "player_client": ["tv_embedded", "ios", "mweb", "web_safari"],
+                "player_skip": ["configs"],
+            },
+        },
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "Version/17.5 Mobile/15E148 Safari/604.1"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
         },
     }
+    # Optional: owner can drop a cookies.txt path via env to bypass bot-checks.
+    cookies = os.getenv("YT_COOKIES_FILE", "").strip()
+    if cookies and os.path.exists(cookies):
+        opts["cookiefile"] = cookies
+    return opts
 
 
 def _sync_download(url: str, workdir: str) -> dict:
@@ -110,8 +128,15 @@ async def download(url: str) -> dict:
 def user_error_text(err: Exception) -> str:
     msg = str(err or "Download failed").strip()
     low = msg.lower()
-    if "sign in to confirm you're not a bot" in low:
-        return "YouTube blocked this request from the server IP. Try another link or retry later."
+    if "sign in to confirm you're not a bot" in low or "confirm you" in low:
+        return (
+            "YouTube is blocking the server IP with a bot-check.\n"
+            "Workarounds:\n"
+            "  • Try the link again in a minute.\n"
+            "  • Owner: export your browser cookies to cookies.txt and set "
+            "the env var YT_COOKIES_FILE=/path/to/cookies.txt, then /restart.\n"
+            "  • Or try a different public video / another platform."
+        )
     if "unable to extract video url" in low or "empty media response" in low:
         return "This platform did not expose a downloadable video stream for that link. Try another public post/reel."
     if "timed out" in low:

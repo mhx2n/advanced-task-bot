@@ -1,4 +1,5 @@
-"""Stylish text generator — 40+ Unicode font styles with inline preview buttons."""
+"""Stylish text generator — 49 Unicode font styles with previewed buttons,
+in-place panel editing, and tap-to-copy output."""
 from __future__ import annotations
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -175,27 +176,52 @@ STYLES: list[tuple[str, callable]] = [
 
 
 # ---------- UI ----------
+_PER_PAGE = 16  # 8 rows of 2
+
+
+def _esc(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _btn_label(name: str, fn) -> str:
+    """Render the style name IN its own style so the button previews it."""
+    try:
+        out = fn(name)
+        if not out or len(out) > 48:
+            return name
+        return out
+    except Exception:
+        return name
+
+
 def _kb(cid: str, page: int = 0) -> InlineKeyboardMarkup:
-    per_page = 16  # 8 rows of 2
-    pages = (len(STYLES) + per_page - 1) // per_page
+    pages = (len(STYLES) + _PER_PAGE - 1) // _PER_PAGE
     page = page % pages
-    start = page * per_page
-    chunk = STYLES[start:start + per_page]
+    start = page * _PER_PAGE
+    chunk = STYLES[start:start + _PER_PAGE]
     rows, row = [], []
-    for i, (name, _) in enumerate(chunk):
+    for i, (name, fn) in enumerate(chunk):
         idx = start + i
-        row.append(InlineKeyboardButton(name, callback_data=f"st:s:{cid}:{idx}"))
+        row.append(InlineKeyboardButton(
+            _btn_label(name, fn), callback_data=f"st:s:{cid}:{idx}:{page}"))
         if len(row) == 2:
             rows.append(row); row = []
     if row: rows.append(row)
-    nav = []
     if pages > 1:
-        nav.append(InlineKeyboardButton("« Prev", callback_data=f"st:p:{cid}:{(page-1) % pages}"))
-        nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="st:noop"))
-        nav.append(InlineKeyboardButton("Next »", callback_data=f"st:p:{cid}:{(page+1) % pages}"))
-    if nav: rows.append(nav)
+        rows.append([
+            InlineKeyboardButton("« Prev", callback_data=f"st:p:{cid}:{(page-1) % pages}"),
+            InlineKeyboardButton(f"{page+1}/{pages}", callback_data="st:noop"),
+            InlineKeyboardButton("Next »", callback_data=f"st:p:{cid}:{(page+1) % pages}"),
+        ])
     rows.append([InlineKeyboardButton("Close", callback_data="st:close")])
     return InlineKeyboardMarkup(rows)
+
+
+def _back_kb(cid: str, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("« Back to styles", callback_data=f"st:p:{cid}:{page}"),
+        InlineKeyboardButton("Close", callback_data="st:close"),
+    ]])
 
 
 def _extract_text(update: Update, args_text: str) -> str:
@@ -205,6 +231,14 @@ def _extract_text(update: Update, args_text: str) -> str:
     if rep and (rep.text or rep.caption):
         return (rep.text or rep.caption).strip()
     return ""
+
+
+def _panel_text(text: str) -> str:
+    return (
+        f"<b>✨ Stylish Text</b>\n"
+        f"Source: <code>{_esc(text)}</code>\n\n"
+        f"Pick a style — the styled result appears right here (tap to copy)."
+    )
 
 
 async def cmd_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,14 +257,8 @@ async def cmd_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     cid = _store(text)
     await update.effective_message.reply_text(
-        f"<b>Stylish Text</b>\nSource: <code>{_esc(text)}</code>\n\nPick a style:",
-        parse_mode="HTML",
-        reply_markup=_kb(cid, 0),
+        _panel_text(text), parse_mode="HTML", reply_markup=_kb(cid, 0),
     )
-
-
-def _esc(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 async def cb_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,32 +272,48 @@ async def cb_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await q.message.delete()
             except Exception: pass
             return
-        _, kind, cid, val = data.split(":", 3)
-        text = _STORE.get(cid)
-        if not text:
-            await q.answer("Session expired. Run /style again.", show_alert=True); return
-        if kind == "p":
-            page = int(val)
+        parts = data.split(":")
+        if parts[1] == "p":
+            cid, page = parts[2], int(parts[3])
+            text = _STORE.get(cid)
+            if not text:
+                await q.answer("Session expired. Run /style again.", show_alert=True); return
             await q.answer()
             try:
-                await q.edit_message_reply_markup(reply_markup=_kb(cid, page))
+                await q.edit_message_text(
+                    _panel_text(text), parse_mode="HTML", reply_markup=_kb(cid, page),
+                )
             except Exception:
                 pass
             return
-        if kind == "s":
-            idx = int(val)
+        if parts[1] == "s":
+            cid = parts[2]; idx = int(parts[3])
+            page = int(parts[4]) if len(parts) > 4 else 0
+            text = _STORE.get(cid)
+            if not text:
+                await q.answer("Session expired. Run /style again.", show_alert=True); return
             name, fn = STYLES[idx]
             try:
                 styled = fn(text)
             except Exception as e:
                 await q.answer(f"Style failed: {e}", show_alert=True); return
-            await q.answer(f"{name} applied")
-            header = f"<b>{_esc(name)}</b>\nSource: <code>{_esc(text)}</code>\n\n"
-            body = _esc(styled)
+            await q.answer(f"{name} ✓ tap text to copy")
+            body = (
+                f"<b>✨ {_esc(name)}</b>\n"
+                f"Source: <code>{_esc(text)}</code>\n\n"
+                f"<code>{_esc(styled)}</code>\n\n"
+                f"<i>👆 Tap the styled text above to copy.</i>"
+            )
             try:
-                await q.message.reply_text(header + body, parse_mode="HTML")
+                await q.edit_message_text(
+                    body, parse_mode="HTML", reply_markup=_back_kb(cid, page),
+                )
             except Exception:
-                await q.message.reply_text(styled)
+                try:
+                    await q.message.reply_text(
+                        body, parse_mode="HTML", reply_markup=_back_kb(cid, page))
+                except Exception:
+                    await q.message.reply_text(styled)
             return
     except Exception as e:
         try: await q.answer(f"Error: {e}", show_alert=True)
