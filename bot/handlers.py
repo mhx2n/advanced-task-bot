@@ -1371,6 +1371,12 @@ async def _gate_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def register_handlers(app: Application):
+    # Global gate: blocks disabled commands for non-owners (highest priority).
+    app.add_handler(
+        MessageHandler(filters.COMMAND, _gate_disabled),
+        group=-2,
+    )
+
     # User
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
