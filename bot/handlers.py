@@ -864,7 +864,55 @@ OWNER_EXTRA = [
     BotCommand("speak",      "Speak as bot in a chat"),
     BotCommand("grant",      "Grant speak access"),
     BotCommand("revoke",     "Revoke speak access"),
+    BotCommand("restart",    "Restart the bot process"),
 ]
+
+
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_owner(user.id):
+        await update.effective_message.reply_text("Owner only.")
+        return
+    msg = await update.effective_message.reply_text(
+        "<b>Restart initiated</b>\n"
+        "<i>The bot is shutting down and will be respawned by the host…</i>\n"
+        "You will receive a confirmation here once it is back online.",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        await db.set_setting("restart_pending", json.dumps({
+            "chat_id": msg.chat_id, "message_id": msg.message_id, "ts": int(time.time()),
+        }))
+    except Exception:
+        pass
+    # Give Telegram a moment to deliver the message before exit.
+    async def _bye():
+        await asyncio.sleep(1.2)
+        import os as _os
+        _os._exit(0)
+    asyncio.create_task(_bye())
+
+
+async def notify_restart_complete(app: Application):
+    """Called on startup: if a restart was requested, edit the message to success."""
+    try:
+        raw = await db.get_setting("restart_pending", "")
+        if not raw:
+            return
+        await db.set_setting("restart_pending", "")
+        data = json.loads(raw)
+        dt = int(time.time()) - int(data.get("ts", 0))
+        await app.bot.edit_message_text(
+            chat_id=data["chat_id"],
+            message_id=data["message_id"],
+            text=(
+                "<b>Restart successful</b>\n"
+                f"<i>Bot is back online in {dt}s and ready to serve.</i>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
 
 
 async def setup_bot_commands(app: Application):
