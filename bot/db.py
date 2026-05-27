@@ -32,6 +32,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at INTEGER,
     PRIMARY KEY (chat_id, message_id)
 );
+CREATE TABLE IF NOT EXISTS speak_grants (
+    user_id INTEGER PRIMARY KEY,
+    granted_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS speak_active (
+    user_id INTEGER PRIMARY KEY,
+    target_chat_id INTEGER,
+    updated_at INTEGER
+);
 """
 
 
@@ -143,3 +152,53 @@ async def get_session(chat_id: int, message_id: int):
             (chat_id, message_id),
         ) as cur:
             return await cur.fetchone()
+
+
+# ---------- speak-as-bot grants ----------
+async def grant_speak(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO speak_grants(user_id, granted_at) VALUES(?,?)",
+            (uid, int(time.time())),
+        )
+        await db.commit()
+
+
+async def revoke_speak(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM speak_grants WHERE user_id=?", (uid,))
+        await db.execute("DELETE FROM speak_active WHERE user_id=?", (uid,))
+        await db.commit()
+
+
+async def can_speak(uid: int, owner_id: int) -> bool:
+    if uid == owner_id:
+        return True
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM speak_grants WHERE user_id=?", (uid,)) as cur:
+            return bool(await cur.fetchone())
+
+
+async def list_speak_grants():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id, granted_at FROM speak_grants") as cur:
+            return await cur.fetchall()
+
+
+async def set_speak_target(uid: int, chat_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if chat_id is None:
+            await db.execute("DELETE FROM speak_active WHERE user_id=?", (uid,))
+        else:
+            await db.execute(
+                "INSERT OR REPLACE INTO speak_active(user_id,target_chat_id,updated_at) VALUES(?,?,?)",
+                (uid, int(chat_id), int(time.time())),
+            )
+        await db.commit()
+
+
+async def get_speak_target(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT target_chat_id FROM speak_active WHERE user_id=?", (uid,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
