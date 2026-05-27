@@ -379,16 +379,31 @@ async def _call_provider(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     root_id = None
     rep = update.effective_message.reply_to_message
-    if rep and rep.from_user and rep.from_user.id == context.bot.id:
-        sess = await db.get_session(update.effective_chat.id, rep.message_id)
-        if sess:
-            provider_key = sess[0]
-            name, fn = REGISTRY.get(provider_key, (name, fn))
-            try:
-                _HISTORY[(update.effective_chat.id, rep.message_id)] = json.loads(sess[1])
-            except Exception:
-                pass
-            root_id = rep.message_id
+    reply_context = ""
+    if rep:
+        if rep.from_user and rep.from_user.id == context.bot.id:
+            sess = await db.get_session(update.effective_chat.id, rep.message_id)
+            if sess:
+                provider_key = sess[0]
+                name, fn = REGISTRY.get(provider_key, (name, fn))
+                try:
+                    _HISTORY[(update.effective_chat.id, rep.message_id)] = json.loads(sess[1])
+                except Exception:
+                    pass
+                root_id = rep.message_id
+        # Always include the replied message's text/caption as extra context.
+        rep_text = (rep.text or rep.caption or "").strip()
+        if rep_text and not root_id:
+            who = "the bot" if (rep.from_user and rep.from_user.id == context.bot.id) else (
+                (rep.from_user.first_name if rep.from_user else "someone") or "someone"
+            )
+            reply_context = (
+                f"[Context — message from {who}]:\n{rep_text[:3000]}\n\n"
+                f"[User's question]:\n"
+            )
+
+    if reply_context:
+        prompt = reply_context + prompt
 
     history_key = (update.effective_chat.id, root_id) if root_id else None
     history = _HISTORY.get(history_key, []) if history_key else []
@@ -527,17 +542,50 @@ async def cmd_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     chat_id = update.effective_chat.id
-    status = await update.effective_message.reply_text("Queued. Downloading...")
+    status = await update.effective_message.reply_text("Queued. Preparing download...")
     info = None
+    loop = asyncio.get_running_loop()
+    last_edit = {"t": 0.0, "text": ""}
+
+    def _fmt_bytes(n: int) -> str:
+        if n <= 0: return "?"
+        for u in ("B", "KB", "MB", "GB"):
+            if n < 1024: return f"{n:.1f} {u}"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+    def _on_progress(p: dict):
+        s = p.get("status")
+        if s == "downloading":
+            dl = p.get("downloaded", 0); tot = p.get("total", 0)
+            pct = (dl / tot * 100) if tot else 0
+            sp = p.get("speed", 0) or 0
+            eta = p.get("eta", 0) or 0
+            txt = (
+                f"Downloading… {pct:.0f}%\n"
+                f"{_fmt_bytes(dl)} / {_fmt_bytes(tot)}  •  {_fmt_bytes(sp)}/s\n"
+                f"ETA: {eta}s"
+            )
+        elif s == "finished":
+            txt = "Download complete. Processing…"
+        else:
+            return
+        if txt == last_edit["text"]:
+            return
+        last_edit["text"] = txt
+        async def _do():
+            try: await status.edit_text(txt)
+            except Exception: pass
+        asyncio.run_coroutine_threadsafe(_do(), loop)
+
     try:
         async with _DOWNLOAD_SEM:
             await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+            info = await asyncio.wait_for(
+                downloader.download(url, progress=_on_progress), timeout=420,
+            )
             try:
-                await status.edit_text("Downloading video...")
-            except Exception: pass
-            info = await asyncio.wait_for(downloader.download(url), timeout=300)
-            try:
-                await status.edit_text(f"Uploading ({human_size(info['size'])})...")
+                await status.edit_text(f"Uploading ({human_size(info['size'])})…")
             except Exception: pass
             caption = clean_text(
                 f"{info['title'] or 'Video'}\n{info['uploader']} • {human_size(info['size'])}"
@@ -546,14 +594,16 @@ async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
                 await context.bot.send_video(
                     chat_id=chat_id, video=f, caption=caption,
                     supports_streaming=True,
-                    write_timeout=180, read_timeout=180,
+                    duration=info.get("duration") or None,
+                    write_timeout=240, read_timeout=240,
                 )
             try: await status.delete()
             except Exception: pass
         await db.log("INFO", update.effective_user.id, "dl", url[:200])
     except asyncio.TimeoutError:
-        try: await status.edit_text("Download timed out.")
+        try: await status.edit_text("Download timed out. Please try again.")
         except Exception: pass
+        await db.log("ERROR", update.effective_user.id, "dl", f"{url} | timeout")
     except Exception as e:
         try: await status.edit_text(f"Download failed:\n{downloader.user_error_text(e)}")
         except Exception: pass
@@ -1203,6 +1253,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sess = await db.get_session(msg.chat_id, msg.reply_to_message.message_id)
         if sess:
             await _call_provider(update, context, sess[0], text); return
+        # No session, but user replied to bot — answer with default provider using context
+        if "g" in REGISTRY:
+            await _call_provider(update, context, "g", text); return
+
+    # 4b) Reply to ANY other message with a plain-text question → answer with context
+    if msg.reply_to_message and not text.startswith(("/", ".")):
+        rep_text = (msg.reply_to_message.text or msg.reply_to_message.caption or "").strip()
+        if rep_text and "g" in REGISTRY:
+            await _call_provider(update, context, "g", text); return
 
     # 5) Dot-prefix commands
     if text.startswith("."):

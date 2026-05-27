@@ -1,6 +1,15 @@
-"""Async video downloader using yt-dlp.
-Supports YouTube, Facebook, Instagram, TikTok and 1000+ sites.
-Concurrency-safe via per-task temp dirs. Capped to keep bot lightweight.
+"""Advanced async video downloader using yt-dlp.
+
+Highlights
+----------
+* Per-task temp dir, concurrency-safe.
+* Smart format ladder — try compact mp4 first, fall back gracefully without
+  blowing past Telegram's upload cap.
+* Pre-flight size probe (no download) → skip impossible files early.
+* Live progress callbacks (% + size + speed + ETA) for the bot's status edit.
+* Multi-client YouTube extractor (tv_embedded → ios → mweb → web_safari)
+  to bypass the most common bot-checks; cookies file supported.
+* Resilient error mapping → friendly user-facing text.
 """
 import asyncio
 import os
@@ -8,7 +17,7 @@ import re
 import shutil
 import tempfile
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import yt_dlp
 
@@ -19,6 +28,12 @@ URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 SUPPORTED_HOSTS = (
     "youtube.com", "youtu.be", "facebook.com", "fb.watch",
     "instagram.com", "tiktok.com", "vt.tiktok.com", "twitter.com", "x.com",
+)
+
+_UA_IOS = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 "
+    "Mobile/15E148 Safari/604.1"
 )
 
 
@@ -34,29 +49,29 @@ def detect_url(text: str) -> Optional[str]:
     return None
 
 
-def _ydl_opts(outtmpl: str, relaxed: bool = False) -> dict:
+def _cookies_path() -> Optional[str]:
+    cookies = os.getenv("YT_COOKIES_FILE", "").strip()
+    if not cookies:
+        default = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "youtube_cookies.txt",
+        )
+        if os.path.exists(default):
+            cookies = default
+    return cookies if cookies and os.path.exists(cookies) else None
+
+
+def _ydl_base() -> dict:
     opts: dict = {
-        "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        # Prefer compact mp4 under cap. Falls back gracefully.
-        "format": (
-            "bv*[ext=mp4]+ba[ext=m4a]/"
-            "bv*+ba/"
-            f"best[filesize<{MAX_BYTES}][ext=mp4]/"
-            f"best[filesize<{MAX_BYTES}]/"
-            "best[height<=720][ext=mp4]/best[height<=720]/best"
-        ) if not relaxed else "bv*+ba/b",
-        "format_sort": ["+size", "+br", "+res", "+fps"],
-        "merge_output_format": "mp4",
-        "concurrent_fragment_downloads": 4,
         "retries": 3,
+        "fragment_retries": 5,
         "socket_timeout": 30,
         "nocheckcertificate": True,
         "geo_bypass": True,
-        # 2024+: YouTube blocks the default "android" client from server IPs.
-        # tv_embedded + ios + mweb still serve streams without PO-token in most regions.
+        "concurrent_fragment_downloads": 4,
+        "merge_output_format": "mp4",
         "extractor_args": {
             "youtube": {
                 "player_client": ["tv_embedded", "ios", "mweb", "web_safari"],
@@ -64,36 +79,109 @@ def _ydl_opts(outtmpl: str, relaxed: bool = False) -> dict:
             },
         },
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/17.5 Mobile/15E148 Safari/604.1"
-            ),
+            "User-Agent": _UA_IOS,
             "Accept-Language": "en-US,en;q=0.9",
         },
     }
-    # Optional: owner can drop a cookies.txt path via env to bypass bot-checks.
-    # Also checks a default youtube_cookies.txt in project root.
-    cookies = os.getenv("YT_COOKIES_FILE", "").strip()
-    if not cookies:
-        default = os.path.join(os.path.dirname(os.path.dirname(__file__)), "youtube_cookies.txt")
-        if os.path.exists(default):
-            cookies = default
-    if cookies and os.path.exists(cookies):
+    cookies = _cookies_path()
+    if cookies:
         opts["cookiefile"] = cookies
     return opts
 
 
-def _sync_download(url: str, workdir: str) -> dict:
-    outtmpl = os.path.join(workdir, "%(id).40s.%(ext)s")
-    last_err = None
-    info = None
-    path = ""
-    for relaxed in (False, True):
+# Format ladder (descending preference). Each tier stays under MAX_BYTES.
+_FORMAT_LADDER = [
+    # Tier 1: best compact mp4 under cap
+    f"bv*[ext=mp4][filesize<{MAX_BYTES}]+ba[ext=m4a]/"
+    f"b[ext=mp4][filesize<{MAX_BYTES}]",
+    # Tier 2: any combo under cap
+    f"bv*[filesize<{MAX_BYTES}]+ba/"
+    f"b[filesize<{MAX_BYTES}]",
+    # Tier 3: capped height
+    "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/"
+    "bv*[height<=720]+ba/b[height<=720]",
+    # Tier 4: even smaller
+    "bv*[height<=480]+ba/b[height<=480]/best[height<=480]",
+    # Tier 5: anything that works
+    "bv*+ba/b",
+]
+
+
+def _make_progress_hook(cb: Optional[Callable[[dict], None]]):
+    if not cb:
+        return None
+    last = {"t": 0.0}
+
+    def hook(d: dict):
         try:
-            with yt_dlp.YoutubeDL(_ydl_opts(outtmpl, relaxed=relaxed)) as ydl:
+            now = time.time()
+            if d.get("status") == "downloading":
+                if now - last["t"] < 1.2:  # throttle
+                    return
+                last["t"] = now
+            cb({
+                "status": d.get("status"),
+                "downloaded": d.get("downloaded_bytes") or 0,
+                "total": d.get("total_bytes") or d.get("total_bytes_estimate") or 0,
+                "speed": d.get("speed") or 0,
+                "eta": d.get("eta") or 0,
+            })
+        except Exception:
+            pass
+    return hook
+
+
+def _probe(url: str) -> dict:
+    """Extract metadata without downloading — used to skip oversized files."""
+    opts = _ydl_base()
+    opts["skip_download"] = True
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if "entries" in info:
+            info = info["entries"][0]
+        return info or {}
+
+
+def _pick_best_size(info: dict) -> int:
+    fmts = info.get("formats") or []
+    best = 0
+    for f in fmts:
+        sz = f.get("filesize") or f.get("filesize_approx") or 0
+        if sz and sz < MAX_BYTES and sz > best:
+            best = sz
+    return best
+
+
+def _sync_download(url: str, workdir: str, progress: Optional[Callable] = None) -> dict:
+    outtmpl = os.path.join(workdir, "%(id).40s.%(ext)s")
+
+    # Pre-flight probe (non-fatal if it fails — some sites block extraction-only).
+    try:
+        probe = _probe(url)
+        dur = probe.get("duration") or 0
+        # crude bitrate floor — 1 hour @ 128kbps is already ~57MB; warn early
+        if dur and dur > 7200:
+            raise RuntimeError("Video too long to fit Telegram's 50 MB limit.")
+    except RuntimeError:
+        raise
+    except Exception:
+        pass  # tolerate probe failure
+
+    last_err: Optional[Exception] = None
+    hook = _make_progress_hook(progress)
+
+    for tier_idx, fmt in enumerate(_FORMAT_LADDER):
+        opts = _ydl_base()
+        opts["outtmpl"] = outtmpl
+        opts["format"] = fmt
+        opts["format_sort"] = ["+size", "+br", "+res", "+fps"]
+        opts["max_filesize"] = MAX_BYTES
+        if hook:
+            opts["progress_hooks"] = [hook]
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                if "entries" in info:  # playlist — take first
+                if "entries" in info:
                     info = info["entries"][0]
                 path = ydl.prepare_filename(info)
                 if not os.path.exists(path):
@@ -102,35 +190,52 @@ def _sync_download(url: str, workdir: str) -> dict:
                         if os.path.exists(base + ext):
                             path = base + ext
                             break
-                if os.path.exists(path):
-                    break
+                if not os.path.exists(path):
+                    raise RuntimeError("Downloaded file vanished.")
+                size = os.path.getsize(path)
+                if size == 0:
+                    raise RuntimeError("Empty download.")
+                if size > MAX_BYTES:
+                    # Try next, smaller tier.
+                    try: os.remove(path)
+                    except Exception: pass
+                    last_err = RuntimeError(
+                        f"Too large at tier {tier_idx+1} ({size/1024/1024:.1f} MB)."
+                    )
+                    continue
+                return {
+                    "path": path,
+                    "size": size,
+                    "title": (info.get("title") or "")[:200],
+                    "uploader": info.get("uploader") or info.get("channel") or "",
+                    "duration": info.get("duration") or 0,
+                    "ext": os.path.splitext(path)[1].lstrip("."),
+                    "thumbnail": info.get("thumbnail"),
+                    "webpage_url": info.get("webpage_url") or url,
+                }
+        except yt_dlp.utils.DownloadError as e:
+            last_err = e
+            msg = str(e).lower()
+            if "max-filesize" in msg or "file is larger" in msg \
+               or "requested format is not available" in msg:
+                continue
+            # bot-check / auth → no point hammering further tiers
+            if "sign in to confirm" in msg or "login required" in msg \
+               or "private" in msg or "age" in msg:
+                raise
+            continue
         except Exception as e:
             last_err = e
-            if not relaxed and "requested format is not available" in str(e).lower():
-                continue
-            raise
-    if not info:
-        raise last_err or RuntimeError("Download failed")
-    size = os.path.getsize(path) if os.path.exists(path) else 0
-    return {
-        "path": path,
-        "size": size,
-        "title": (info.get("title") or "")[:200],
-        "uploader": info.get("uploader") or info.get("channel") or "",
-        "duration": info.get("duration") or 0,
-        "ext": os.path.splitext(path)[1].lstrip("."),
-        "thumbnail": info.get("thumbnail"),
-        "webpage_url": info.get("webpage_url") or url,
-    }
+            continue
+
+    raise last_err or RuntimeError("Download failed after all fallbacks.")
 
 
-async def download(url: str) -> dict:
+async def download(url: str, progress: Optional[Callable] = None) -> dict:
     """Download a video. Returns dict with path/size/title or raises."""
     workdir = tempfile.mkdtemp(prefix="dl_")
     try:
-        info = await asyncio.to_thread(_sync_download, url, workdir)
-        if info["size"] == 0:
-            raise RuntimeError("Downloaded file is empty.")
+        info = await asyncio.to_thread(_sync_download, url, workdir, progress)
         if info["size"] > MAX_BYTES:
             try: os.remove(info["path"])
             except Exception: pass
@@ -138,7 +243,6 @@ async def download(url: str) -> dict:
                 f"File too large for Telegram ({info['size']/1024/1024:.1f} MB). "
                 f"Max {MAX_BYTES/1024/1024:.0f} MB."
             )
-        # caller is responsible for cleanup via cleanup()
         info["_workdir"] = workdir
         return info
     except Exception:
@@ -149,20 +253,28 @@ async def download(url: str) -> dict:
 def user_error_text(err: Exception) -> str:
     msg = str(err or "Download failed").strip()
     low = msg.lower()
-    if "sign in to confirm you're not a bot" in low or "confirm you" in low:
+    if "sign in to confirm" in low or "confirm you" in low:
         return (
-            "YouTube is blocking the server IP with a bot-check.\n"
-            "Workarounds:\n"
-            "  • Try the link again in a minute.\n"
-            "  • Owner: export your browser cookies to cookies.txt and set "
-            "the env var YT_COOKIES_FILE=/path/to/cookies.txt, then /restart.\n"
-            "  • Or try a different public video / another platform."
+            "YouTube is asking for sign-in verification on the server.\n"
+            "Please try a different public link, or ask the owner to refresh "
+            "the cookies file."
         )
-    if "unable to extract video url" in low or "empty media response" in low:
-        return "This platform did not expose a downloadable video stream for that link. Try another public post/reel."
-    if "timed out" in low:
+    if "login required" in low or "private" in low:
+        return "This post is private or requires login."
+    if "age" in low and "restricted" in low:
+        return "Age-restricted content cannot be downloaded without login."
+    if "too long" in low or "too large" in low or "max " in low:
+        return (
+            "This video is too large for Telegram's 50 MB bot upload limit. "
+            "Try a shorter clip or a lower-quality source."
+        )
+    if "unable to extract" in low or "empty media response" in low:
+        return "This link did not expose a downloadable video stream."
+    if "timed out" in low or "timeout" in low:
         return "The remote site took too long to respond. Please try again."
-    return msg[:500]
+    if "unsupported url" in low:
+        return "This site is not supported."
+    return "Download failed. Please try another link or try again later."
 
 
 def cleanup(info: dict):
