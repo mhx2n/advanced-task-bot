@@ -699,6 +699,9 @@ async def on_any_owner_message(update: Update, context: ContextTypes.DEFAULT_TYP
     _PENDING_ANNOUNCE.discard(uid)
     status = await msg.reply_text("Preparing broadcast...")
     await _broadcast_copy(context, msg.chat_id, msg.message_id, status)
+    # Stop other handlers (on_text, etc.) from also processing this message.
+    from telegram.ext import ApplicationHandlerStop
+    raise ApplicationHandlerStop
 
 
 
