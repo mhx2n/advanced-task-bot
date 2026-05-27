@@ -223,8 +223,6 @@ async def on_res_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.edit_message_text("Session expired. Send /res again.")
         except Exception: pass
         return
-    if not await db.quota_check_and_inc(uid, "res", DAILY_LIMIT) == (True, _):  # noqa
-        pass
     ok, used = await db.quota_check_and_inc(uid, "res", DAILY_LIMIT)
     if not ok:
         try:
