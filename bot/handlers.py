@@ -1325,22 +1325,49 @@ async def notify_restart_complete(app: Application):
 
 async def setup_bot_commands(app: Application):
     try:
-        await app.bot.set_my_commands(USER_COMMANDS, scope=BotCommandScopeDefault())
+        disabled = await _disabled_set()
+        user_cmds = [c for c in USER_COMMANDS if c.command not in disabled]
+        owner_extra = [c for c in OWNER_EXTRA if c.command not in disabled]
+        await app.bot.set_my_commands(user_cmds, scope=BotCommandScopeDefault())
         if OWNER_ID:
             await app.bot.set_my_commands(
-                USER_COMMANDS + OWNER_EXTRA, scope=BotCommandScopeChat(OWNER_ID),
+                user_cmds + owner_extra, scope=BotCommandScopeChat(OWNER_ID),
             )
         # Also give granted speak users the /speak command
         for u, _ in await db.list_speak_grants():
             try:
+                extra = [BotCommand("speak", "Speak as bot")] if "speak" not in disabled else []
                 await app.bot.set_my_commands(
-                    USER_COMMANDS + [BotCommand("speak", "Speak as bot")],
+                    user_cmds + extra,
                     scope=BotCommandScopeChat(u),
                 )
             except Exception:
                 pass
     except Exception:
         pass
+
+
+async def _gate_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs in group=-2 before any command handler. Blocks disabled commands for non-owners."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    text = msg.text.strip()
+    if not text.startswith("/"):
+        return
+    cmd = text[1:].split()[0].split("@", 1)[0].lower()
+    uid = update.effective_user.id if update.effective_user else 0
+    if is_owner(uid):
+        return
+    disabled = await _disabled_set()
+    if cmd in disabled:
+        try:
+            await msg.reply_text("This command is currently disabled by the owner.")
+        except Exception:
+            pass
+        from telegram.ext import ApplicationHandlerStop
+        raise ApplicationHandlerStop
+
 
 
 def register_handlers(app: Application):
