@@ -353,7 +353,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await force_join_ok(update, context): return
     await update.effective_message.reply_text(
-        "Main menu:", reply_markup=main_menu_kb(update.effective_user.id),
+        "Main menu:", reply_markup=await main_menu_kb(update.effective_user.id),
     )
 
 
