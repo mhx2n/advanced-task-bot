@@ -545,30 +545,161 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"Failed: {e}")
 
 
-async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _owner_only(update): return
-    text = " ".join(context.args).strip()
-    rep = update.effective_message.reply_to_message
-    if not text and rep:
-        text = rep.text or rep.caption or ""
-    if not text:
-        await update.effective_message.reply_text(
-            "Usage: /announce <text>  or reply to a message with /announce")
-        return
+_PENDING_ANNOUNCE: set[int] = set()  # owner_ids awaiting a source message of any type
+
+
+async def _broadcast_copy(context: ContextTypes.DEFAULT_TYPE, src_chat_id: int,
+                          src_message_id: int, status_msg) -> None:
+    """Broadcast by copying a source message (any type, with caption preserved) to all users."""
     ids = await db.all_user_ids()
-    ok = fail = 0
-    status = await update.effective_message.reply_text(f"Broadcasting to {len(ids)} users...")
+    total = len(ids)
+    ok = fail = blocked = 0
+    try:
+        await status_msg.edit_text(f"Broadcasting to {total} users...")
+    except Exception:
+        pass
     for i, uid in enumerate(ids, 1):
         try:
-            await context.bot.send_message(uid, clean_text(text))
+            await context.bot.copy_message(
+                chat_id=uid, from_chat_id=src_chat_id, message_id=src_message_id,
+            )
             ok += 1
-        except Exception:
-            fail += 1
+        except Exception as e:
+            es = str(e).lower()
+            if "blocked" in es or "deactivated" in es or "chat not found" in es:
+                blocked += 1
+            else:
+                fail += 1
+        # gentle rate-limit: 25 msgs/sec is the Telegram global cap; stay well under
         if i % 25 == 0:
-            await asyncio.sleep(1)
-            try: await status.edit_text(f"Progress {i}/{len(ids)}  ok={ok} fail={fail}")
-            except Exception: pass
-    await status.edit_text(f"Done.\nDelivered: {ok}\nFailed: {fail}")
+            await asyncio.sleep(1.0)
+            try:
+                await status_msg.edit_text(
+                    f"Progress {i}/{total}\nDelivered: {ok}\nBlocked: {blocked}\nFailed: {fail}"
+                )
+            except Exception:
+                pass
+    try:
+        await status_msg.edit_text(
+            f"<b>Broadcast complete</b>\n"
+            f"Total: {total}\nDelivered: {ok}\nBlocked/deleted: {blocked}\nFailed: {fail}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+
+async def _broadcast_text(context: ContextTypes.DEFAULT_TYPE, text: str, status_msg) -> None:
+    ids = await db.all_user_ids()
+    total = len(ids)
+    ok = fail = blocked = 0
+    for i, uid in enumerate(ids, 1):
+        try:
+            await context.bot.send_message(uid, text)
+            ok += 1
+        except Exception as e:
+            es = str(e).lower()
+            if "blocked" in es or "deactivated" in es or "chat not found" in es:
+                blocked += 1
+            else:
+                fail += 1
+        if i % 25 == 0:
+            await asyncio.sleep(1.0)
+            try:
+                await status_msg.edit_text(
+                    f"Progress {i}/{total}\nDelivered: {ok}\nBlocked: {blocked}\nFailed: {fail}"
+                )
+            except Exception:
+                pass
+    try:
+        await status_msg.edit_text(
+            f"<b>Broadcast complete</b>\n"
+            f"Total: {total}\nDelivered: {ok}\nBlocked/deleted: {blocked}\nFailed: {fail}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+
+async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Universal broadcast.
+
+    Modes:
+    1) Reply to ANY message (photo / video / audio / document / voice / sticker /
+       text — with or without caption) and send /announce  → copies that exact
+       message to every user.
+    2) /announce <text>  → broadcasts plain text.
+    3) Send a photo/video/audio/document with caption "/announce" or "/announce <extra>"
+       → broadcasts that media (caption is preserved as-is, minus the /announce token).
+    4) Click "Announce" in the Owner panel, then send the very next message in ANY
+       format → that message is broadcast.
+    """
+    if not await _owner_only(update):
+        return
+    msg = update.effective_message
+    text_args = " ".join(context.args).strip() if context.args else ""
+
+    # Mode 1: replying to any kind of message → copy it
+    rep = msg.reply_to_message
+    if rep is not None:
+        status = await msg.reply_text("Preparing broadcast...")
+        await _broadcast_copy(context, rep.chat_id, rep.message_id, status)
+        return
+
+    # Mode 3: media sent WITH the /announce command in caption
+    has_media = any([
+        msg.photo, msg.video, msg.audio, msg.voice, msg.document,
+        msg.animation, msg.sticker, msg.video_note,
+    ])
+    if has_media:
+        status = await msg.reply_text("Preparing broadcast...")
+        await _broadcast_copy(context, msg.chat_id, msg.message_id, status)
+        return
+
+    # Mode 2: text args
+    if text_args:
+        status = await msg.reply_text("Preparing broadcast...")
+        await _broadcast_text(context, text_args, status)
+        return
+
+    # Mode 4: arm pending; next owner message (any type) becomes the source
+    _PENDING_ANNOUNCE.add(update.effective_user.id)
+    await msg.reply_text(
+        "Send the announcement now — it can be any type:\n"
+        "text, photo, video, audio, voice, document, GIF, or sticker "
+        "(with or without caption).\n\n"
+        "Send /cancel to abort."
+    )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    removed = False
+    if uid in _PENDING_ANNOUNCE:
+        _PENDING_ANNOUNCE.discard(uid); removed = True
+    if uid in _AWAIT_INPUT:
+        _AWAIT_INPUT.pop(uid, None); removed = True
+    await update.effective_message.reply_text(
+        "Pending action cancelled." if removed else "Nothing to cancel."
+    )
+
+
+async def on_any_owner_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches the owner's next message of ANY type when a broadcast is armed."""
+    msg = update.effective_message
+    if not msg:
+        return
+    uid = update.effective_user.id if update.effective_user else 0
+    if uid not in _PENDING_ANNOUNCE:
+        return
+    # do not capture a fresh /announce or /cancel command — let the command handlers run
+    raw_text = msg.text or msg.caption or ""
+    if raw_text.startswith(("/announce", "/cancel")):
+        return
+    _PENDING_ANNOUNCE.discard(uid)
+    status = await msg.reply_text("Preparing broadcast...")
+    await _broadcast_copy(context, msg.chat_id, msg.message_id, status)
+
 
 
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
