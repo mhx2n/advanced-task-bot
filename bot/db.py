@@ -51,7 +51,35 @@ CREATE TABLE IF NOT EXISTS custom_providers (
     created_at INTEGER,
     updated_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS usage_quota (
+    user_id INTEGER,
+    tool TEXT,
+    day TEXT,
+    count INTEGER DEFAULT 0,
+    PRIMARY KEY (user_id, tool, day)
+);
 """
+
+
+async def quota_check_and_inc(user_id: int, tool: str, daily_limit: int) -> tuple[bool, int]:
+    """Returns (allowed, used_after). Atomically increments if allowed."""
+    import datetime as _dt
+    day = _dt.datetime.utcnow().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT count FROM usage_quota WHERE user_id=? AND tool=? AND day=?",
+            (user_id, tool, day))
+        row = await cur.fetchone()
+        used = row[0] if row else 0
+        if used >= daily_limit:
+            return False, used
+        new = used + 1
+        await db.execute(
+            "INSERT INTO usage_quota(user_id,tool,day,count) VALUES(?,?,?,?) "
+            "ON CONFLICT(user_id,tool,day) DO UPDATE SET count=excluded.count",
+            (user_id, tool, day, new))
+        await db.commit()
+        return True, new
 
 
 async def init_db():
