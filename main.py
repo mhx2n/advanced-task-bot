@@ -14,7 +14,7 @@ from telegram.ext import ApplicationBuilder
 
 from bot.config import BOT_TOKEN, PORT
 from bot.db import init_db
-from bot.handlers import register_handlers, setup_bot_commands
+from bot.handlers import register_handlers, setup_bot_commands, notify_restart_complete
 from bot.health import run_in_thread
 
 logging.basicConfig(
