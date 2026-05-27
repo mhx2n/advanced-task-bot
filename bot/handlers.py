@@ -1069,6 +1069,7 @@ def register_handlers(app: Application):
     _language.register(app)
     _photo.register(app)
     _shorten.register(app)
+    _stylish.register(app)
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(InlineQueryHandler(on_inline_query))
