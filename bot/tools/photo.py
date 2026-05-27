@@ -181,13 +181,25 @@ def _resize(img_bytes: bytes, w: int, h: int) -> bytes:
     return out.getvalue()
 
 
-def _res_kb() -> InlineKeyboardMarkup:
-    rows, row = [], []
-    for label, key, w, h in RESIZE_PRESETS:
-        row.append(InlineKeyboardButton(f"{label} ({w}×{h})", callback_data=f"res:{key}"))
-        if len(row) == 1:
-            rows.append(row); row = []
-    if row: rows.append(row)
+_RES_PER_PAGE = 6
+
+
+def _res_kb(page: int = 0) -> InlineKeyboardMarkup:
+    total = len(RESIZE_PRESETS)
+    pages = (total + _RES_PER_PAGE - 1) // _RES_PER_PAGE
+    page = page % pages
+    start = page * _RES_PER_PAGE
+    chunk = RESIZE_PRESETS[start:start + _RES_PER_PAGE]
+    rows = []
+    for label, key, w, h in chunk:
+        rows.append([InlineKeyboardButton(
+            f"{label} ({w}×{h})", callback_data=f"res:s:{key}")])
+    if pages > 1:
+        rows.append([
+            InlineKeyboardButton("« Prev", callback_data=f"res:p:{(page-1) % pages}"),
+            InlineKeyboardButton(f"{page+1}/{pages}", callback_data="res:noop"),
+            InlineKeyboardButton("Next »", callback_data=f"res:p:{(page+1) % pages}"),
+        ])
     rows.append([InlineKeyboardButton("Close", callback_data="res:close")])
     return InlineKeyboardMarkup(rows)
 
