@@ -304,7 +304,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.effective_message.reply_text(
         txt, parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu_kb(update.effective_user.id),
+        reply_markup=await main_menu_kb(update.effective_user.id),
     )
 
 
