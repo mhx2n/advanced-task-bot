@@ -379,16 +379,31 @@ async def _call_provider(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     root_id = None
     rep = update.effective_message.reply_to_message
-    if rep and rep.from_user and rep.from_user.id == context.bot.id:
-        sess = await db.get_session(update.effective_chat.id, rep.message_id)
-        if sess:
-            provider_key = sess[0]
-            name, fn = REGISTRY.get(provider_key, (name, fn))
-            try:
-                _HISTORY[(update.effective_chat.id, rep.message_id)] = json.loads(sess[1])
-            except Exception:
-                pass
-            root_id = rep.message_id
+    reply_context = ""
+    if rep:
+        if rep.from_user and rep.from_user.id == context.bot.id:
+            sess = await db.get_session(update.effective_chat.id, rep.message_id)
+            if sess:
+                provider_key = sess[0]
+                name, fn = REGISTRY.get(provider_key, (name, fn))
+                try:
+                    _HISTORY[(update.effective_chat.id, rep.message_id)] = json.loads(sess[1])
+                except Exception:
+                    pass
+                root_id = rep.message_id
+        # Always include the replied message's text/caption as extra context.
+        rep_text = (rep.text or rep.caption or "").strip()
+        if rep_text and not root_id:
+            who = "the bot" if (rep.from_user and rep.from_user.id == context.bot.id) else (
+                (rep.from_user.first_name if rep.from_user else "someone") or "someone"
+            )
+            reply_context = (
+                f"[Context — message from {who}]:\n{rep_text[:3000]}\n\n"
+                f"[User's question]:\n"
+            )
+
+    if reply_context:
+        prompt = reply_context + prompt
 
     history_key = (update.effective_chat.id, root_id) if root_id else None
     history = _HISTORY.get(history_key, []) if history_key else []
