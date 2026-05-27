@@ -19,7 +19,7 @@ from telegram.ext import (
 
 from . import db, downloader
 from .config import OWNER_ID, FORCE_JOIN_CHANNEL
-from .providers import REGISTRY
+from .providers import REGISTRY, register as register_provider, make_openai_compatible_provider
 from .utils import clean_text, format_ai_answer, chunk_text, escape_html, human_size
 from .keycheck import inspect_key, try_model
 
@@ -453,6 +453,16 @@ async def _run_download(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
 # ============================================================
 async def _owner_only(update: Update) -> bool:
     return is_owner(update.effective_user.id)
+
+
+async def load_custom_providers(app: Application | None = None):
+    rows = await db.list_custom_providers()
+    for cmd, name, base_url, api_key, model, enabled in rows:
+        if not enabled:
+            continue
+        register_provider(cmd, name, make_openai_compatible_provider(name, base_url, api_key, model))
+        if app:
+            app.add_handler(CommandHandler(cmd, make_provider_handler(cmd)))
 
 
 async def cmd_owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
