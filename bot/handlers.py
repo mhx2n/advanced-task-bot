@@ -973,7 +973,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "m:home":
-        await q.edit_message_text("Main menu:", reply_markup=main_menu_kb(uid)); return
+        await q.edit_message_text("Main menu:", reply_markup=await main_menu_kb(uid)); return
+
+    # Categorized tool menu
+    if data.startswith("cat:"):
+        cat = data.split(":", 1)[1]
+        await q.edit_message_text(
+            f"<b>{escape_html(cat)}</b>\n\nTap a tool for details.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=await category_kb(cat),
+        )
+        return
+    if data.startswith("tool:"):
+        cmd = data.split(":", 1)[1]
+        cat, t = _find_tool(cmd)
+        if not t:
+            await q.edit_message_text("Tool not found.", reply_markup=await main_menu_kb(uid)); return
+        _, label, doc = t
+        await q.edit_message_text(
+            f"<b>/{cmd} — {escape_html(label)}</b>\n\n{doc}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tool_detail_kb(cat),
+            disable_web_page_preview=True,
+        )
+        return
     if data == "m:providers":
         await q.edit_message_text("Choose an AI provider:", reply_markup=providers_kb()); return
     if data == "m:keytools":
