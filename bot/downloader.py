@@ -188,7 +188,8 @@ def _make_progress_hook(cb: Optional[Callable[[dict], None]]):
 
 def _probe(url: str) -> dict:
     """Extract metadata without downloading — used to skip oversized files."""
-    opts = _ydl_base()
+    url = _normalize_url(url)
+    opts = _ydl_base(url)
     opts["skip_download"] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -208,6 +209,7 @@ def _pick_best_size(info: dict) -> int:
 
 
 def _sync_download(url: str, workdir: str, progress: Optional[Callable] = None) -> dict:
+    url = _normalize_url(url)
     outtmpl = os.path.join(workdir, "%(id).40s.%(ext)s")
 
     # Pre-flight probe (non-fatal if it fails — some sites block extraction-only).
@@ -226,7 +228,7 @@ def _sync_download(url: str, workdir: str, progress: Optional[Callable] = None) 
     hook = _make_progress_hook(progress)
 
     for tier_idx, fmt in enumerate(_FORMAT_LADDER):
-        opts = _ydl_base()
+        opts = _ydl_base(url)
         opts["outtmpl"] = outtmpl
         opts["format"] = fmt
         opts["format_sort"] = ["+size", "+br", "+res", "+fps"]
@@ -283,7 +285,10 @@ def _sync_download(url: str, workdir: str, progress: Optional[Callable] = None) 
             last_err = e
             continue
 
-    raise last_err or RuntimeError("Download failed after all fallbacks.")
+    platform = platform_from_url(url)
+    if last_err:
+        raise RuntimeError(f"[{platform}] {last_err}")
+    raise RuntimeError(f"[{platform}] Download failed after all fallbacks.")
 
 
 async def download(url: str, progress: Optional[Callable] = None) -> dict:
