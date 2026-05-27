@@ -304,7 +304,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.effective_message.reply_text(
         txt, parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_menu_kb(update.effective_user.id),
+        reply_markup=await main_menu_kb(update.effective_user.id),
     )
 
 
@@ -353,7 +353,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await force_join_ok(update, context): return
     await update.effective_message.reply_text(
-        "Main menu:", reply_markup=main_menu_kb(update.effective_user.id),
+        "Main menu:", reply_markup=await main_menu_kb(update.effective_user.id),
     )
 
 
@@ -973,7 +973,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "m:home":
-        await q.edit_message_text("Main menu:", reply_markup=main_menu_kb(uid)); return
+        await q.edit_message_text("Main menu:", reply_markup=await main_menu_kb(uid)); return
+
+    # Categorized tool menu
+    if data.startswith("cat:"):
+        cat = data.split(":", 1)[1]
+        await q.edit_message_text(
+            f"<b>{escape_html(cat)}</b>\n\nTap a tool for details.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=await category_kb(cat),
+        )
+        return
+    if data.startswith("tool:"):
+        cmd = data.split(":", 1)[1]
+        cat, t = _find_tool(cmd)
+        if not t:
+            await q.edit_message_text("Tool not found.", reply_markup=await main_menu_kb(uid)); return
+        _, label, doc = t
+        await q.edit_message_text(
+            f"<b>/{cmd} — {escape_html(label)}</b>\n\n{doc}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=tool_detail_kb(cat),
+            disable_web_page_preview=True,
+        )
+        return
     if data == "m:providers":
         await q.edit_message_text("Choose an AI provider:", reply_markup=providers_kb()); return
     if data == "m:keytools":
@@ -1075,6 +1098,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(
                 "Send channel username (without @), or 'off' to disable.",
                 reply_markup=owner_kb()); return
+        if sub == "noop":
+            return
+        if sub.startswith("toggle:"):
+            try: page = int(sub.split(":", 1)[1])
+            except Exception: page = 0
+            await q.edit_message_text(
+                "<b>Toggle Commands</b>\n\nTap a command to turn it ON/OFF. "
+                "Disabled commands are hidden from the menu and blocked from use.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=await toggle_kb(page),
+            )
+            return
+
+    # Toggle a single command on/off
+    if data.startswith("tg:"):
+        if not is_owner(uid): return
+        parts = data.split(":")
+        cmd = parts[1]; page = int(parts[2]) if len(parts) > 2 else 0
+        disabled = await _disabled_set()
+        if cmd in disabled: disabled.discard(cmd)
+        else: disabled.add(cmd)
+        await _set_disabled(disabled)
+        try:
+            await setup_bot_commands(context.application)
+        except Exception:
+            pass
+        await q.edit_message_text(
+            "<b>Toggle Commands</b>\n\nTap a command to turn it ON/OFF.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=await toggle_kb(page),
+        )
+        return
 
 
 # ============================================================
@@ -1270,16 +1325,20 @@ async def notify_restart_complete(app: Application):
 
 async def setup_bot_commands(app: Application):
     try:
-        await app.bot.set_my_commands(USER_COMMANDS, scope=BotCommandScopeDefault())
+        disabled = await _disabled_set()
+        user_cmds = [c for c in USER_COMMANDS if c.command not in disabled]
+        owner_extra = [c for c in OWNER_EXTRA if c.command not in disabled]
+        await app.bot.set_my_commands(user_cmds, scope=BotCommandScopeDefault())
         if OWNER_ID:
             await app.bot.set_my_commands(
-                USER_COMMANDS + OWNER_EXTRA, scope=BotCommandScopeChat(OWNER_ID),
+                user_cmds + owner_extra, scope=BotCommandScopeChat(OWNER_ID),
             )
         # Also give granted speak users the /speak command
         for u, _ in await db.list_speak_grants():
             try:
+                extra = [BotCommand("speak", "Speak as bot")] if "speak" not in disabled else []
                 await app.bot.set_my_commands(
-                    USER_COMMANDS + [BotCommand("speak", "Speak as bot")],
+                    user_cmds + extra,
                     scope=BotCommandScopeChat(u),
                 )
             except Exception:
@@ -1288,7 +1347,36 @@ async def setup_bot_commands(app: Application):
         pass
 
 
+async def _gate_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs in group=-2 before any command handler. Blocks disabled commands for non-owners."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    text = msg.text.strip()
+    if not text.startswith("/"):
+        return
+    cmd = text[1:].split()[0].split("@", 1)[0].lower()
+    uid = update.effective_user.id if update.effective_user else 0
+    if is_owner(uid):
+        return
+    disabled = await _disabled_set()
+    if cmd in disabled:
+        try:
+            await msg.reply_text("This command is currently disabled by the owner.")
+        except Exception:
+            pass
+        from telegram.ext import ApplicationHandlerStop
+        raise ApplicationHandlerStop
+
+
+
 def register_handlers(app: Application):
+    # Global gate: blocks disabled commands for non-owners (highest priority).
+    app.add_handler(
+        MessageHandler(filters.COMMAND, _gate_disabled),
+        group=-2,
+    )
+
     # User
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
