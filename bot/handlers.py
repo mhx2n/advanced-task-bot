@@ -943,6 +943,9 @@ USER_COMMANDS = [
     BotCommand("gra",   "Grammar fix (AI)"),
     BotCommand("syn",   "Synonyms & antonyms"),
     BotCommand("prn",   "Pronunciation + audio"),
+    BotCommand("bg",    "Remove image background"),
+    BotCommand("enh",   "Enhance a photo"),
+    BotCommand("res",   "Resize image (presets)"),
     BotCommand("ping",  "Latency check"),
     BotCommand("help",  "Help (add a topic for AI summary)"),
 ]
