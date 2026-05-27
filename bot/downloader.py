@@ -313,12 +313,28 @@ async def download(url: str, progress: Optional[Callable] = None) -> dict:
 def user_error_text(err: Exception) -> str:
     msg = str(err or "Download failed").strip()
     low = msg.lower()
-    if "sign in to confirm" in low or "confirm you" in low:
+    platform = "generic"
+    m = re.match(r"^\[([a-z0-9_:-]+)\]\s*(.*)$", msg, flags=re.IGNORECASE)
+    if m:
+        platform = m.group(1).lower()
+        low = m.group(2).lower()
+    if ("sign in to confirm" in low or "confirm you" in low) and platform == "youtube":
         return (
             "YouTube is asking for sign-in verification on the server.\n"
             "Please try a different public link, or ask the owner to refresh "
             "the cookies file."
         )
+    if platform == "tiktok":
+        if "unable to extract webpage video data" in low or "empty media response" in low:
+            return (
+                "TikTok blocked this short link or did not expose the video stream right now.\n"
+                "Try opening the link once in a browser, copy the full TikTok video URL, then send that link again."
+            )
+        if "login required" in low or "private" in low or "status code 403" in low or "forbidden" in low:
+            return (
+                "This TikTok post is restricted from the server right now.\n"
+                "Try a public full video link, or refresh TikTok-access cookies/headers on the server."
+            )
     if "login required" in low or "private" in low:
         return "This post is private or requires login."
     if "age" in low and "restricted" in low:
