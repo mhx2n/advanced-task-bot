@@ -18,7 +18,9 @@ import shutil
 import tempfile
 import time
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
+import requests
 import yt_dlp
 
 # Telegram bot upload cap (~50 MB for regular bots)
@@ -34,6 +36,12 @@ _UA_IOS = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 "
     "Mobile/15E148 Safari/604.1"
+)
+
+_UA_DESKTOP = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
 )
 
 
@@ -60,7 +68,46 @@ def _cookies_path() -> Optional[str]:
     return cookies if cookies and os.path.exists(cookies) else None
 
 
-def _ydl_base() -> dict:
+def platform_from_url(url: str) -> str:
+    host = (urlparse(url or "").netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host.endswith("youtube.com") or host == "youtu.be":
+        return "youtube"
+    if host.endswith("tiktok.com"):
+        return "tiktok"
+    if host.endswith("instagram.com"):
+        return "instagram"
+    if host.endswith("facebook.com") or host == "fb.watch":
+        return "facebook"
+    if host.endswith("twitter.com") or host == "x.com":
+        return "twitter"
+    return "generic"
+
+
+def _normalize_url(url: str) -> str:
+    low = (url or "").lower()
+    if "vt.tiktok.com/" not in low and "vm.tiktok.com/" not in low:
+        return url
+    try:
+        resp = requests.get(
+            url,
+            headers={
+                "User-Agent": _UA_DESKTOP,
+                "Referer": "https://www.tiktok.com/",
+            },
+            timeout=15,
+            allow_redirects=True,
+        )
+        final_url = (resp.url or "").strip()
+        if final_url and "tiktok.com/" in final_url.lower():
+            return final_url
+    except Exception:
+        pass
+    return url
+
+
+def _ydl_base(url: str) -> dict:
     opts: dict = {
         "noplaylist": True,
         "quiet": True,
@@ -72,20 +119,28 @@ def _ydl_base() -> dict:
         "geo_bypass": True,
         "concurrent_fragment_downloads": 4,
         "merge_output_format": "mp4",
-        "extractor_args": {
+        "http_headers": {
+            "User-Agent": _UA_DESKTOP,
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    }
+    platform = platform_from_url(url)
+    if platform == "youtube":
+        opts["http_headers"]["User-Agent"] = _UA_IOS
+        opts["extractor_args"] = {
             "youtube": {
                 "player_client": ["tv_embedded", "ios", "mweb", "web_safari"],
                 "player_skip": ["configs"],
             },
-        },
-        "http_headers": {
-            "User-Agent": _UA_IOS,
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    }
-    cookies = _cookies_path()
-    if cookies:
-        opts["cookiefile"] = cookies
+        }
+        cookies = _cookies_path()
+        if cookies:
+            opts["cookiefile"] = cookies
+    elif platform == "tiktok":
+        opts["http_headers"].update({
+            "Referer": "https://www.tiktok.com/",
+            "Origin": "https://www.tiktok.com",
+        })
     return opts
 
 
