@@ -1,4 +1,6 @@
 import re
+import os
+import time
 import html
 
 # Strict cleaner — strips ALL markup. Used for safe plain text broadcast.
@@ -82,3 +84,52 @@ def human_size(n: int) -> str:
             return f"{n:.1f}{unit}"
         n /= 1024
     return f"{n:.1f}TB"
+
+
+def safe_user_error(scope: str = "Request") -> str:
+    return f"{scope} could not be completed right now. Please try again shortly."
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds or 0))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if mins:
+        parts.append(f"{mins}m")
+    if secs or not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def process_metrics(started_at: int | None = None) -> dict:
+    rss_bytes = 0
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                    rss_bytes = rss_kb * 1024
+                    break
+    except Exception:
+        pass
+
+    try:
+        load_avg = os.getloadavg()
+    except Exception:
+        load_avg = (0.0, 0.0, 0.0)
+
+    now = int(time.time())
+    return {
+        "rss_bytes": rss_bytes,
+        "load_1": load_avg[0],
+        "load_5": load_avg[1],
+        "load_15": load_avg[2],
+        "cpu_count": os.cpu_count() or 1,
+        "uptime_s": max(0, now - int(started_at or now)),
+    }

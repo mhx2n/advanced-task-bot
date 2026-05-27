@@ -295,8 +295,8 @@ async def cb_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name, fn = STYLES[idx]
             try:
                 styled = fn(text)
-            except Exception as e:
-                await q.answer(f"Style failed: {e}", show_alert=True); return
+            except Exception:
+                await q.answer("Style could not be applied right now.", show_alert=True); return
             await q.answer(f"{name} ✓ tap text to copy")
             body = (
                 f"<b>✨ {_esc(name)}</b>\n"
@@ -315,8 +315,8 @@ async def cb_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     await q.message.reply_text(styled)
             return
-    except Exception as e:
-        try: await q.answer(f"Error: {e}", show_alert=True)
+    except Exception:
+        try: await q.answer("This action could not be completed right now.", show_alert=True)
         except Exception: pass
 
 

@@ -20,7 +20,7 @@ from telegram.ext import (
 from . import db, downloader
 from .config import OWNER_ID, FORCE_JOIN_CHANNEL
 from .providers import REGISTRY, register as register_provider, make_openai_compatible_provider
-from .utils import clean_text, format_ai_answer, chunk_text, escape_html, human_size
+from .utils import clean_text, format_ai_answer, chunk_text, escape_html, human_size, safe_user_error, process_metrics, format_duration
 from .keycheck import inspect_key, try_model
 from .tools import textenc as _textenc, language as _language, photo as _photo, shorten as _shorten, stylish as _stylish, translate as _translate, ocr as _ocr
 
@@ -29,6 +29,7 @@ _HISTORY: dict = defaultdict(list)
 _PENDING_KEY: dict = {}     # user_id -> last inspected api key
 _AWAIT_INPUT: dict = {}     # user_id -> ("key"|"download"|"tryke"|"announce"|"speak_to"|"grant"|"revoke")
 _DOWNLOAD_SEM = asyncio.Semaphore(3)  # cap concurrent downloads
+_PROCESS_STARTED_AT = int(time.time())
 
 
 # ============================================================
@@ -347,7 +348,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ans = await asyncio.wait_for(fn(feature_doc, []), timeout=60)
         await safe_edit(placeholder, format_ai_answer(ans))
     except Exception as e:
-        await safe_edit(placeholder, f"Help failed: {e}")
+        await safe_edit(placeholder, safe_user_error("Help"))
+        await db.log("ERROR", update.effective_user.id if update.effective_user else 0, "help", str(e)[:500])
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -483,7 +485,8 @@ async def _do_inspect(update: Update, key: str):
         lines.append("\nTry a model: <code>/tryke &lt;model&gt; &lt;prompt&gt;</code>")
         await safe_edit(placeholder, "\n".join(lines))
     except Exception as e:
-        await safe_edit(placeholder, f"Inspection failed: <code>{escape_html(str(e))}</code>")
+        await safe_edit(placeholder, safe_user_error("Key inspection"))
+        await db.log("ERROR", update.effective_user.id, "key", str(e)[:500])
 
 
 async def cmd_tryke(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -502,7 +505,8 @@ async def cmd_tryke(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out = await asyncio.wait_for(try_model(key, model, prompt), timeout=120)
         await stream_edit(placeholder, f"<b>{escape_html(model)}</b>\n\n{format_ai_answer(out)}")
     except Exception as e:
-        await safe_edit(placeholder, f"Call failed: <code>{escape_html(str(e))}</code>")
+        await safe_edit(placeholder, safe_user_error("Model test"))
+        await db.log("ERROR", update.effective_user.id, "tryke", str(e)[:500])
 
 
 # ============================================================
@@ -640,7 +644,8 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = int(context.args[0]); await db.set_banned(uid, 1)
         await update.effective_message.reply_text(f"User {uid} banned.")
     except Exception as e:
-        await update.effective_message.reply_text(f"Failed: {e}")
+        await update.effective_message.reply_text(safe_user_error("Request"))
+        await db.log("ERROR", update.effective_user.id, "owner", str(e)[:500])
 
 
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -651,7 +656,8 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = int(context.args[0]); await db.set_banned(uid, 0)
         await update.effective_message.reply_text(f"User {uid} unbanned.")
     except Exception as e:
-        await update.effective_message.reply_text(f"Failed: {e}")
+        await update.effective_message.reply_text(safe_user_error("Request"))
+        await db.log("ERROR", update.effective_user.id, "owner", str(e)[:500])
 
 
 _PENDING_ANNOUNCE: set[int] = set()  # owner_ids awaiting a source message of any type
@@ -914,7 +920,8 @@ async def cmd_speak(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat = await context.bot.get_chat(target if target.startswith("@") else f"@{target}")
             chat_id = chat.id
         except Exception as e:
-            await update.effective_message.reply_text(f"Cannot resolve {target}: {e}")
+            await update.effective_message.reply_text("Could not resolve that chat. Check the username or chat ID and try again.")
+            await db.log("ERROR", uid, "speak", f"resolve {target} | {e}")
             return
     else:
         chat_id = int(target)
@@ -942,7 +949,8 @@ async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.grant_speak(uid)
         await update.effective_message.reply_text(f"Granted speak-as-bot to {uid}.")
     except Exception as e:
-        await update.effective_message.reply_text(f"Failed: {e}")
+        await update.effective_message.reply_text(safe_user_error("Grant update"))
+        await db.log("ERROR", update.effective_user.id, "grant", str(e)[:500])
 
 
 async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -954,7 +962,8 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.revoke_speak(uid)
         await update.effective_message.reply_text(f"Revoked from {uid}.")
     except Exception as e:
-        await update.effective_message.reply_text(f"Failed: {e}")
+        await update.effective_message.reply_text(safe_user_error("Grant update"))
+        await db.log("ERROR", update.effective_user.id, "revoke", str(e)[:500])
 
 
 # ============================================================
@@ -1178,7 +1187,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(target, text)
             await msg.reply_text(f"→ sent to {target}")
         except Exception as e:
-            await msg.reply_text(f"Send failed: {e}")
+            await msg.reply_text("Message could not be sent to the target chat.")
+            await db.log("ERROR", uid, "speak", str(e)[:500])
         return
 
     # 3) Auto-detect video URLs and offer download

@@ -21,6 +21,7 @@ from telegram.ext import (
 )
 
 from .. import db
+from ..utils import safe_user_error
 
 DAILY_LIMIT = 10
 MAX_BYTES = 10 * 1024 * 1024  # 10 MB input cap
@@ -98,8 +99,8 @@ async def cmd_bg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_PHOTO)
     try:
         out = await _removebg_api(img, api_key)
-    except Exception as e:
-        await msg.reply_text(_frame("Background Removal", f"Failed: {str(e)[:300]}"),
+    except Exception:
+        await msg.reply_text(_frame("Background Removal", safe_user_error("Background removal")),
                              parse_mode=ParseMode.HTML); return
     await msg.reply_document(document=io.BytesIO(out), filename="no-bg.png",
                              caption="<b>Background removed</b>", parse_mode=ParseMode.HTML)
@@ -131,8 +132,8 @@ async def cmd_enh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out = await asyncio.to_thread(_enhance, img)
     except UnidentifiedImageError:
         await msg.reply_text("That doesn't look like a valid image."); return
-    except Exception as e:
-        await msg.reply_text(f"Enhancement failed: {e}"); return
+    except Exception:
+        await msg.reply_text(safe_user_error("Enhancement")); return
     await msg.reply_document(document=io.BytesIO(out), filename="enhanced.jpg",
                              caption="<b>Photo enhanced</b>", parse_mode=ParseMode.HTML)
 
@@ -255,8 +256,8 @@ async def on_res_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         out = await asyncio.to_thread(_resize, img, w, h)
-    except Exception as e:
-        try: await q.edit_message_text(f"Resize failed: {e}")
+    except Exception:
+        try: await q.edit_message_text(safe_user_error("Resize"))
         except Exception: pass
         return
     await context.bot.send_chat_action(q.message.chat_id, ChatAction.UPLOAD_PHOTO)
