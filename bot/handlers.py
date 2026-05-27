@@ -289,9 +289,9 @@ async def _call_provider(update: Update, context: ContextTypes.DEFAULT_TYPE,
     try:
         answer = await asyncio.wait_for(fn(prompt, history), timeout=180)
         answer_fmt = format_ai_answer(answer) or "No content returned."
-        body = f"*{name}*\n\n{answer_fmt}"
+        body = f"<b>{escape_html(name)}</b>\n\n{answer_fmt}"
         if placeholder:
-            await safe_edit(placeholder, body)
+            await stream_edit(placeholder, body)
             sent = placeholder
         else:
             sent = await send_md(update.effective_message, body)
@@ -300,8 +300,10 @@ async def _call_provider(update: Update, context: ContextTypes.DEFAULT_TYPE,
         hist = _HISTORY[(update.effective_chat.id, new_root)]
         hist.append({"q": prompt, "a": (answer or "")[:4000]})
         _HISTORY[(update.effective_chat.id, new_root)] = hist[-10:]
-        await db.save_session(update.effective_chat.id, new_root, provider_key,
-                              json.dumps(_HISTORY[(update.effective_chat.id, new_root)]))
+        state = json.dumps(_HISTORY[(update.effective_chat.id, new_root)])
+        await db.save_session(update.effective_chat.id, new_root, provider_key, state)
+        if sent.message_id != new_root:
+            await db.save_session(update.effective_chat.id, sent.message_id, provider_key, state)
         await db.log("INFO", update.effective_user.id, provider_key, prompt[:200])
     except asyncio.TimeoutError:
         msg = f"{name} timed out. Please retry."
@@ -348,30 +350,30 @@ async def _do_inspect(update: Update, key: str):
         info = await inspect_key(key)
         if not info.get("valid"):
             await safe_edit(placeholder,
-                f"*{info.get('provider', 'Unknown')}*  •  INVALID\n"
-                f"Status: `{info.get('status')}`\n"
-                f"Detail: `{json.dumps(info.get('error'))[:500]}`")
+                f"<b>{escape_html(info.get('provider', 'Unknown'))}</b>  •  INVALID\n"
+                f"Status: <code>{escape_html(str(info.get('status')))}</code>\n"
+                f"Detail: <code>{escape_html(json.dumps(info.get('error'))[:500])}</code>")
             return
         _PENDING_KEY[update.effective_user.id] = key
         models = info.get("models", [])
         limits = info.get("limits", {})
         lines = [
-            f"*{info['provider']}*  •  ACTIVE",
-            f"Models available: *{len(models)}*",
+            f"<b>{escape_html(info['provider'])}</b>  •  ACTIVE",
+            f"Models available: <b>{len(models)}</b>",
             "",
         ]
         for m in models[:30]:
-            lines.append(f"• `{m}`")
+            lines.append(f"• <code>{escape_html(m)}</code>")
         if len(models) > 30:
             lines.append(f"... +{len(models)-30} more")
         if limits:
-            lines.append("\n*Limits / Quota:*")
+            lines.append("\n<b>Limits / Quota:</b>")
             for k, v in limits.items():
-                lines.append(f"  • {k}: `{v}`")
-        lines.append("\nTry a model: `/tryke <model> <prompt>`")
+                lines.append(f"  • {escape_html(str(k))}: <code>{escape_html(str(v))}</code>")
+        lines.append("\nTry a model: <code>/tryke &lt;model&gt; &lt;prompt&gt;</code>")
         await safe_edit(placeholder, "\n".join(lines))
     except Exception as e:
-        await safe_edit(placeholder, f"Inspection failed: `{e}`")
+        await safe_edit(placeholder, f"Inspection failed: <code>{escape_html(str(e))}</code>")
 
 
 async def cmd_tryke(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -388,9 +390,9 @@ async def cmd_tryke(update: Update, context: ContextTypes.DEFAULT_TYPE):
     placeholder = await update.effective_message.reply_text(f"Calling {model}...")
     try:
         out = await asyncio.wait_for(try_model(key, model, prompt), timeout=120)
-        await safe_edit(placeholder, f"*{model}*\n\n{format_ai_answer(out)}")
+        await stream_edit(placeholder, f"<b>{escape_html(model)}</b>\n\n{format_ai_answer(out)}")
     except Exception as e:
-        await safe_edit(placeholder, f"Call failed: `{e}`")
+        await safe_edit(placeholder, f"Call failed: <code>{escape_html(str(e))}</code>")
 
 
 # ============================================================
