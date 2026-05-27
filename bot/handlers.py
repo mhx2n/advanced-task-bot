@@ -995,9 +995,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if kind == "download":
             url = downloader.detect_url(text) or text
             await _run_download(update, context, url); return
-        if kind == "announce":
-            context.args = text.split()
-            await cmd_announce(update, context); return
+        # (the legacy text-only "announce" path is replaced by _PENDING_ANNOUNCE
+        # which is handled by on_any_owner_message and supports every message type)
         if kind == "speak_to":
             context.args = [text.split()[0]]
             await cmd_speak(update, context); return
